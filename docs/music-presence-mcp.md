@@ -328,36 +328,42 @@ data, but all four MCP tools fail closed and do not describe it as current.
 
 ## VPS deployment gate (local templates ready; not executed)
 
-The VPS was inspected read-only, but no upload, install, service restart, proxy
-change, certificate request, secret creation, Auth0 write, or deployment has
-been performed. The approved design uses separate web/MCP sslip.io hosts,
-loopback ports `9090`/`9091`, Caddy, two systemd services, and encrypted systemd
-credentials. Every write command still needs a separate approval.
+Historical VPS evidence has been reviewed, but the currently installed Caddy
+source, binary, modules, systemd command line, and live Shared Diary Caddyfile
+have not been re-inspected in this no-VPS phase. No upload, install, service
+restart, proxy change, certificate request, secret creation, Auth0 write, or
+deployment has been performed. The approved design uses separate web/MCP
+sslip.io hosts, loopback ports `9090`/`9091`, Caddy, two systemd services, and
+encrypted systemd credentials. Every VPS write still needs separate approval.
 
-The player Basic Auth account is injected as an encrypted systemd credential.
-For the audited Caddy 2.6.2 host, the version-pinned service drop-in directs its
-fixed autosave path to `/dev/null`, so no expanded username/hash JSON is stored;
-the plaintext password is never stored. The account exists only in the
-systemd-provided read-only runtime credential and Caddy process memory. A Caddy
-upgrade requires a fresh audit of this measure. Activating it requires one
-separately approved Caddy restart before the Eryu route is added. No restart or
-reload has been executed.
+The historically observed Caddy 2.6.2 is blocked from hosting Eryu. Caddy must
+first pass the separate source/module/systemd inventory, exact-version upgrade,
+Shared Diary regression, and rollback gates in
+[`deploy/CADDY-UPGRADE.md`](../deploy/CADDY-UPGRADE.md). The post-upgrade Eryu
+fragment uses `basic_auth`; the shared root Caddyfile must natively set
+`persist_config off` and move the Admin API to a permissioned `0600` Unix
+socket before the encrypted account credential is loaded. The old
+XDG/autosave symlink workaround and default localhost Admin API are no longer
+part of the deployment. No Caddy upgrade, restart, or reload has been executed.
 
 After approval, deployment should proceed in these separately verified stages:
 
-1. Read-only inspection of the VPS checkout, current service manager, listener,
-   reverse proxy, TLS, firewall, and backup/rollback path.
-2. Present the exact target paths and commands for confirmation; do not transmit
-   or print any secret during this step.
-3. Upload or pull only the reviewed feature-branch commit, install in an
-   isolated environment, and run the full tests and credential scan.
-4. Inject `MUSIC_U`, the two internal tokens, and the Caddy Basic Auth account
+1. Read-only inventory the actual Caddy package source, exact binary and hash,
+   modules, systemd commands/drop-ins, and file-backed Shared Diary routes.
+2. Upgrade Caddy in its own approved maintenance window and complete the Shared
+   Diary regression; do not add Eryu during that window.
+3. Present the exact Eryu target paths and commands for confirmation; do not
+   transmit or print any secret during this step.
+4. Pull only the approved 40-hex feature-branch commit, verify the remote tip,
+   and check it out detached before installing in an isolated environment.
+5. Inject `MUSIC_U`, the two internal tokens, and the Caddy Basic Auth account
    only through encrypted systemd credentials. Public Auth0 metadata remains
    separate from secrets.
-5. Start the backend/MCP topology, then verify health, auth denial, fresh/stale
-   presence, OAuth discovery, and all four read-only tools.
-6. Keep the previous release intact until verification succeeds; rollback or
-   any service restart beyond the approved plan needs a separate decision.
+6. Start the backend/MCP topology only after separate approval, then verify
+   health, auth denial, fresh/stale presence, OAuth discovery, and all four
+   read-only tools before a separately approved Caddy reload.
+7. Keep both the pre-upgrade Caddy artifacts and previous application release
+   intact until verification succeeds; no rollback or restart is automatic.
 
 The final target is a ChatGPT-connectable HTTPS Streamable HTTP MCP, not merely
 local stdio. `stdio` remains only as a local regression/debug mode. See

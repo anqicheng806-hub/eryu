@@ -1,7 +1,8 @@
 # Private test web player. Caddy terminates HTTPS and the Python server remains
 # bound to loopback, so ports 9090/9091 must not be opened in the firewall.
-# Caddy 2.6.x uses the legacy directive spelling "basicauth". The imported
-# account line is supplied as an encrypted systemd credential at service start.
+# This fragment requires the post-upgrade Caddy selected by CADDY-UPGRADE.md.
+# Caddy 2.6.2 is intentionally unsupported. The imported account line is
+# supplied as an encrypted systemd credential at service start.
 eryu.95.169.17.214.sslip.io {
 	handle /health {
 		header {
@@ -13,7 +14,7 @@ eryu.95.169.17.214.sslip.io {
 	}
 
 	handle {
-		basicauth {
+		basic_auth {
 			import {$CREDENTIALS_DIRECTORY}/ERYU_BASIC_AUTH_ENTRY
 		}
 

@@ -1,8 +1,8 @@
 # Auth0 与 ChatGPT 远程 MCP 配置清单
 
-状态：已只读访问 Auth0 的公开 OIDC discovery；尚未登录或修改 Auth0
-控制台，也尚未在 ChatGPT 创建连接。不要在本文件、截图、聊天、命令参数或
-普通配置文件中填写任何秘密。
+状态：2026-08-14 已只读核验 Auth0 的公开 OIDC 与 OAuth metadata；用户已在
+Auth0 控制台完成人工配置，但尚未在 ChatGPT 创建连接。不要在本文件、截图、
+聊天、命令参数或普通配置文件中填写任何秘密。
 
 ## 固定地址
 
@@ -28,13 +28,18 @@ origin；ChatGPT 会把 metadata 中这个精确值作为 OAuth `resource` 参�
 - 打开 **Client ID Metadata Document Registration**。
 - 保持 **Dynamic Client Registration (DCR)** 关闭。
 
-2026-08-14 的公开 discovery 已确认 issuer、PKCE `S256` 和 token endpoint
-auth method `none`，但当前没有公布
-`client_id_metadata_document_supported: true`。因此 CIMD 尚不能标为 live-ready；
-在控制台人工开启对应设置后，必须重新读取 discovery，直到该字段明确为
-`true` 才进入 ChatGPT 连接阶段。discovery 当前也列出了
-`registration_endpoint`，但这不能代替控制台对 DCR 开关的核对；本项目仍要求
-DCR 保持关闭。
+2026-08-14 的公开 OIDC 与 OAuth metadata 首次请求均已确认：issuer 精确为
+`https://dev-k1463twcjjecqewp.us.auth0.com/`、PKCE 包含 `S256`、token endpoint
+auth method 包含 `none`，且
+`client_id_metadata_document_supported: true`。CIMD capability 的公开 discovery
+门槛已经通过，不需要等待缓存重试。metadata 仍列出 `registration_endpoint`，
+但公开一个 URL 不能证明 DCR 开关状态；DCR 保持关闭仍以用户在 Auth0 控制台
+的人工核对为准。
+
+公开 metadata 不能独立证明 API Audience、RFC 9068、RBAC、Role/用户分配、
+domain-level connection 或 Client access。当前 `No apps allowed` 是安全基线，
+也表示还没有 ChatGPT client 被授权；导入 ChatGPT CIMD application 后，只为
+该 app 增加 User-Delegated `music:read`，不要开放默认第三方或 M2M access。
 
 还要只读检查租户是否仍有旧 Rules，以及 Actions 是否会改写 `scope`。
 若存在，不要先改；把名称和行为记录下来再单独评估。

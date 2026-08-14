@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -80,18 +83,18 @@ class DeploymentTemplateTest(unittest.TestCase):
         self.assertRegex(player, r"(?m)^\s*handle /health \{")
         self.assertRegex(player, r'(?m)^\s*respond "ok" 200$')
         self.assertIn('Cache-Control "no-store"', player)
-        self.assertRegex(player, r"(?m)^\s*basicauth \{")
-        self.assertNotRegex(player, r"(?m)^\s*basic_auth\b")
+        self.assertRegex(player, r"(?m)^\s*basic_auth \{")
+        self.assertNotRegex(player, r"(?m)^\s*basicauth\b")
         self.assertIn(
             "import {$CREDENTIALS_DIRECTORY}/ERYU_BASIC_AUTH_ENTRY",
             player,
         )
         self.assertIn("header_up -Authorization", player)
-        basicauth_offset = re.search(r"(?m)^\s*basicauth \{", player)
-        self.assertIsNotNone(basicauth_offset)
-        self.assertLess(player.index("handle /health"), basicauth_offset.start())
+        basic_auth_offset = re.search(r"(?m)^\s*basic_auth \{", player)
+        self.assertIsNotNone(basic_auth_offset)
+        self.assertLess(player.index("handle /health"), basic_auth_offset.start())
         self.assertLess(
-            basicauth_offset.start(),
+            basic_auth_offset.start(),
             player.index("reverse_proxy 127.0.0.1:9090"),
         )
         self.assertNotRegex(mcp, r"(?m)^\s*basic(?:_)?auth\b")
@@ -113,51 +116,444 @@ class DeploymentTemplateTest(unittest.TestCase):
         self.assertEqual(
             assignments,
             [
-                "RuntimeDirectory=eryu-caddy-config",
-                "RuntimeDirectoryMode=0700",
-                "RuntimeDirectoryPreserve=no",
-                "Environment=XDG_CONFIG_HOME=/run/eryu-caddy-config",
-                "ExecStartPre=/usr/bin/install -d -m 0700 "
-                "/run/eryu-caddy-config/caddy",
-                "ExecStartPre=/usr/bin/ln -sfnT /dev/null "
-                "/run/eryu-caddy-config/caddy/autosave.json",
                 "LoadCredentialEncrypted=ERYU_BASIC_AUTH_ENTRY:"
                 "/etc/credstore.encrypted/eryu/ERYU_BASIC_AUTH_ENTRY.cred",
             ],
         )
-        self.assertIn("autosave.json", drop_in)
-        self.assertIn("/dev/null", drop_in)
-        self.assertNotIn("XDG_DATA_HOME", drop_in)
+        self.assertNotIn("RuntimeDirectory", drop_in)
+        self.assertNotIn("XDG_CONFIG_HOME", drop_in)
+        self.assertNotIn("autosave.json", drop_in)
+        self.assertNotIn("ExecStartPre", drop_in)
         self.assertNotRegex(drop_in, r"\$2[aby]\$")
         self.assertNotRegex(drop_in, r"(?i)password\s*=")
 
         plan = self.read("README.md")
+        upgrade_plan = self.read("CADDY-UPGRADE.md")
+        self.assertIn("Caddy 2.6.2 不允许直接承载 Eryu", upgrade_plan)
+        self.assertIn("persist_config off", upgrade_plan)
+        self.assertIn("admin unix//run/caddy/admin.sock|0600", upgrade_plan)
+        self.assertIn("--address unix//run/caddy/admin.sock", upgrade_plan)
+        self.assertIn("basic_auth", upgrade_plan)
+        self.assertIn("GHSA-6365-7ppr-5r92", upgrade_plan)
+        self.assertIn("v2.11.5", upgrade_plan)
+        self.assertIn("list-modules --packages --versions", upgrade_plan)
+        self.assertIn('test "$systemd_major" -ge 254', upgrade_plan)
+        self.assertIn("Admin-API-only", upgrade_plan)
+        self.assertIn("--environ", upgrade_plan)
+        self.assertNotIn("ln -sfnT /dev/null", plan)
+        self.assertNotIn("XDG_CONFIG_HOME=/run/eryu-caddy-config", plan)
+        readonly_section = upgrade_plan.split(
+            "## 3. 下一次 VPS 只读盘点（必须先单独批准）", 1
+        )[1].split("## 4.", 1)[0]
+        self.assertNotIn("validate --config", readonly_section)
+        visible_unit_inventory = readonly_section.split(
+            "# 只输出固定分类", 1
+        )[0]
+        self.assertNotIn("--property=ExecStart \\", visible_unit_inventory)
+        self.assertNotIn("--property=ExecReload \\", visible_unit_inventory)
         self.assertIn(
-            'test "$(/usr/bin/caddy version | awk \'{print $1}\')" = "v2.6.2"',
-            plan,
+            "caddy_exec_start=approved_file_backed_form", readonly_section
+        )
+        self.assertIn("caddy_exec_resume=absent", readonly_section)
+        self.assertIn("caddy_exec_start=unapproved_form", readonly_section)
+        self.assertIn("caddy_exec_reload=unapproved_form", readonly_section)
+        self.assertIn("ignore_errors=no", readonly_section)
+        self.assertIn("--property=ExecStartEx", readonly_section)
+        self.assertIn("--property=ExecReloadEx", readonly_section)
+        self.assertIn("caddy_exec_start_ex=empty_flags", readonly_section)
+        self.assertIn("caddy_exec_reload_ex=empty_flags", readonly_section)
+        self.assertIn("unapproved_flags_or_form", readonly_section)
+        self.assertIn("not_one_direct_record", readonly_section)
+        self.assertIn("unset caddy_exec_start_record", readonly_section)
+        self.assertIn("unset caddy_exec_reload_record", readonly_section)
+        self.assertIn("caddy_runtime_inputs=present", readonly_section)
+        self.assertIn("caddy_expect_empty_bus_property", readonly_section)
+        self.assertIn("/usr/bin/busctl --system get-property", readonly_section)
+        self.assertIn('test -z "${DBUS_SYSTEM_BUS_ADDRESS+x}"', readonly_section)
+        self.assertLess(
+            readonly_section.index("set +x"),
+            readonly_section.index("/usr/bin/busctl --system get-property"),
+        )
+        self.assertIn("EnvironmentFiles 'a(sb) 0'", readonly_section)
+        self.assertIn("ImportCredential 'as 0'", readonly_section)
+        self.assertIn("LoadCredentialEncrypted 'a(ss) 0'", readonly_section)
+        self.assertIn("caddy_journal_secret_name_hit=present", readonly_section)
+        self.assertIn("caddy_lifecycle_hooks=present", readonly_section)
+        self.assertIn("ExecConditionEx", readonly_section)
+        self.assertIn("ExecStartPreEx", readonly_section)
+        self.assertIn("ExecStartPostEx", readonly_section)
+        self.assertIn("ExecStopEx", readonly_section)
+        self.assertIn("ExecStopPostEx", readonly_section)
+        self.assertIn(
+            'manager_pipeline_status=("${PIPESTATUS[@]}")', readonly_section
         )
         self.assertIn(
-            'grep -Fxq "XDG_CONFIG_HOME=/run/eryu-caddy-config"',
-            plan,
+            'journal_pipeline_status=("${PIPESTATUS[@]}")', readonly_section
         )
-        self.assertGreaterEqual(
-            plan.count(
-                "sudo test -L /run/eryu-caddy-config/caddy/autosave.json"
-            ),
-            2,
+        self.assertIn("匹配行和值永远不显示", readonly_section)
+        self.assertIn("不得自动 vacuum/delete journal", upgrade_plan)
+        self.assertIn("历史 `--environ` 暴露状态记为", upgrade_plan)
+        self.assertIn("`unknown` 并停止", upgrade_plan)
+        self.assertIn("caddy_runtime_inputs=absent", upgrade_plan)
+        self.assertIn(
+            "for trusted_binary in /usr/bin/caddy /usr/bin/git "
+            "/usr/bin/awk /usr/bin/busctl /usr/bin/sudo",
+            upgrade_plan,
         )
+        self.assertIn("/usr/bin/stat -c '%U:%G'", upgrade_plan)
+        self.assertIn("8#$trusted_binary_mode & 0022", upgrade_plan)
+        self.assertIn("/usr/bin/dpkg-query -S", upgrade_plan)
+        self.assertNotIn("/usr/bin/dpkg --verify", upgrade_plan)
+        self.assertIn("/usr/bin/sha256sum", upgrade_plan)
+        self.assertIn("sha256=", upgrade_plan)
+        self.assertIn("维护审批记录", upgrade_plan)
+        self.assertIn("caddy_readonly_gate=failed", upgrade_plan)
+        self.assertIn("|| readonly_gate_failed", upgrade_plan)
+        self.assertIn("KEY|AUTHORIZATION|CREDENTIAL|BEARER", upgrade_plan)
+        self.assertIn("caddy_unit_identity=caddy:caddy", upgrade_plan)
+        self.assertIn("caddy_need_daemon_reload=no", upgrade_plan)
+        self.assertIn("caddy_existing_drop_ins=absent", upgrade_plan)
+        self.assertIn("caddy_existing_runtime_directory=absent", upgrade_plan)
+        self.assertIn("caddy_unit_fragment=approved sha256=", upgrade_plan)
+        self.assertIn("精确版本的 `.deb` 解包", upgrade_plan)
+        self.assertIn("RuntimeDirectory=caddy", upgrade_plan)
+        self.assertIn("RuntimeDirectoryMode=0750", upgrade_plan)
+        self.assertIn("RuntimeDirectoryPreserve=no", upgrade_plan)
+        self.assertIn("配置文件 mode\n   `0640`", upgrade_plan)
+        self.assertIn("Caddy 二进制 mode `0750`", upgrade_plan)
+        self.assertIn("root-only\n   manifest", upgrade_plan)
+        self.assertIn("NeedDaemonReload=no", upgrade_plan)
 
         helper = self.read("create-caddy-basic-auth-credential.sh")
-        self.assertIn("systemd-ask-password", helper)
-        self.assertIn("caddy hash-password --algorithm bcrypt", helper)
-        self.assertIn('systemd-creds encrypt --name="$CREDENTIAL_NAME"', helper)
+        self.assertIn("/usr/bin/systemd-ask-password", helper)
+        self.assertIn("/usr/bin/caddy hash-password --algorithm bcrypt", helper)
+        self.assertIn('/usr/bin/systemd-creds encrypt --name="$CREDENTIAL_NAME"', helper)
         self.assertNotIn("--plaintext", helper)
         self.assertNotIn("set -x", helper)
         self.assertIn("set +x", helper)
         self.assertIn("printf '%s\\n'", helper)
         self.assertNotIn("tee", helper)
         self.assertIn('[[ ! -e "$CREDENTIAL_PATH" ]]', helper)
+        self.assertIn('[[ ! -L "$CREDENTIAL_PATH" ]]', helper)
+        self.assertIn('[[ -d /etc && ! -L /etc ]]', helper)
+        self.assertIn('"$CREDENTIAL_PARENT_DIR" "$CREDENTIAL_DIR"', helper)
+        self.assertIn("root:root:700", helper)
         self.assertIn("20-72 bytes", helper)
+        self.assertNotIn('command -v "$required_command"', helper)
+
+    def test_release_is_pinned_to_the_verified_remote_tip_and_checked_out_detached(self) -> None:
+        plan = self.read("README.md")
+        upgrade_plan = self.read("CADDY-UPGRADE.md")
+        self.assertIn("Approved 40-hex release SHA", plan)
+        self.assertIn("^[0-9a-f]{40}$", plan)
+        self.assertIn('test "$(command -v git)" = /usr/bin/git', plan)
+        self.assertIn('test "$(command -v awk)" = /usr/bin/awk', plan)
+        self.assertIn("ls-remote --exit-code --heads", plan)
+        self.assertIn("eryu_release_gate=failed", plan)
+        self.assertIn("remote_release_ref", plan)
+        self.assertIn('test "$remote_release_sha" = "$ERYU_RELEASE_SHA"', plan)
+        self.assertIn("--single-branch --no-checkout", plan)
+        self.assertIn('checkout --detach "$ERYU_RELEASE_SHA"', plan)
+        self.assertIn("refs/remotes/origin/$ERYU_BRANCH", plan)
+        self.assertIn("rev-parse HEAD", plan)
+        self.assertIn("rev-parse --abbrev-ref HEAD", plan)
+        self.assertNotIn('/usr/bin/sudo "$(readlink -f', plan)
+        self.assertIn('test "$(command -v sudo)" = /usr/bin/sudo', plan)
+        self.assertNotRegex(plan, r"(?m)(?<!/usr/bin/)\bsudo\s")
+        self.assertNotRegex(upgrade_plan, r"(?m)(?<!/usr/bin/)\bsudo\s")
+
+    def test_caddy_credential_activation_precedes_eryu_route_installation(self) -> None:
+        plan = self.read("README.md")
+        daemon_reload = plan.index("/usr/bin/systemctl daemon-reload")
+        credential_restart = plan.index("/usr/bin/systemctl restart caddy.service")
+        route_install = plan.index(
+            "/usr/bin/sudo /usr/bin/install -o root -g root -m 0644 "
+            "/opt/eryu/current/deploy/caddy/eryu.caddy"
+        )
+        final_reload = plan.index("/usr/bin/systemctl reload caddy.service")
+        self.assertLess(daemon_reload, credential_restart)
+        self.assertLess(credential_restart, route_install)
+        self.assertLess(route_install, final_reload)
+        self.assertIn("只做 reload 不能替代这次 activation", plan)
+        self.assertIn("admin\\.sock\\|0600", plan)
+        self.assertIn("--address unix//run/caddy/admin.sock", plan)
+        self.assertIn("caddy_exec_start=approved_post_upgrade_form", plan)
+        self.assertIn("caddy_exec_reload=approved_post_upgrade_form", plan)
+        self.assertIn("Caddy ExecStart classification failed", plan)
+        self.assertIn("Caddy ExecReload classification failed", plan)
+        self.assertIn("Caddy ExecStartEx classification failed", plan)
+        self.assertIn("Caddy ExecReloadEx classification failed", plan)
+        self.assertIn("caddy_exec_start_ex=empty_flags", plan)
+        self.assertIn("caddy_exec_reload_ex=empty_flags", plan)
+        self.assertIn("Caddy lifecycle hook classification failed", plan)
+        self.assertIn('if test "$caddy_lifecycle_hooks" != absent; then', plan)
+        self.assertNotIn(
+            "--property=ExecReload --value | grep -Fq", plan
+        )
+        self.assertIn("--unit=eryu-caddy-base-validate", plan)
+        self.assertIn("caddy_credential_activation=failed", plan)
+        self.assertIn("Approved exact post-Eryu DropInPaths record", plan)
+        self.assertNotIn("Approved exact LoadCredentialEncrypted record", plan)
+        self.assertIn("caddy_expect_bus_property", plan)
+        self.assertIn("/usr/bin/busctl --system get-property", plan)
+        activation_start = plan.index("caddy_activation_failed() {")
+        activation_end = plan.index("```", activation_start)
+        activation_section = plan[activation_start:activation_end]
+        self.assertIn(
+            'test -z "${DBUS_SYSTEM_BUS_ADDRESS+x}"', activation_section
+        )
+        activation_xtrace_guard = plan.rfind("set +x", 0, activation_start)
+        self.assertGreaterEqual(activation_xtrace_guard, 0)
+        self.assertLess(
+            activation_xtrace_guard,
+            plan.index("/usr/bin/busctl --system get-property", activation_start),
+        )
+        self.assertIn("Environment 'as 0'", plan)
+        self.assertIn("EnvironmentFiles 'a(sb) 0'", plan)
+        self.assertIn("PassEnvironment 'as 0'", plan)
+        self.assertIn("LoadCredential 'a(ss) 0'", plan)
+        self.assertIn("ImportCredential 'as 0'", plan)
+        self.assertIn("SetCredential 'a(say) 0'", plan)
+        self.assertIn("SetCredentialEncrypted 'a(say) 0'", plan)
+        self.assertIn(
+            'a(ss) 1 "ERYU_BASIC_AUTH_ENTRY" '
+            '"/etc/credstore.encrypted/eryu/ERYU_BASIC_AUTH_ENTRY.cred"',
+            plan,
+        )
+        self.assertIn(
+            "/usr/bin/caddy validate --config /etc/caddy/Caddyfile "
+            "--adapter caddyfile || caddy_activation_failed",
+            plan,
+        )
+        self.assertIn(
+            "/usr/bin/systemctl restart caddy.service || "
+            "caddy_activation_failed",
+            plan,
+        )
+        post_reload_unit_check = plan.index(
+            "caddy_effective_need_daemon_reload="
+        )
+        self.assertLess(daemon_reload, post_reload_unit_check)
+        self.assertLess(post_reload_unit_check, credential_restart)
+        self.assertIn("caddy_effective_drop_in_paths", plan)
+        self.assertIn(
+            "caddy_runtime_inputs=one_approved_encrypted_credential", plan
+        )
+        self.assertIn(
+            "for effective_exec_property in ExecStart ExecStartEx "
+            "ExecReload ExecReloadEx",
+            plan,
+        )
+        self.assertGreaterEqual(plan.count("ExecStopPost ExecStopPostEx"), 2)
+        self.assertIn("caddy:caddy:600", plan)
+        self.assertIn(
+            'test "$(/usr/bin/sudo /usr/bin/stat -c \'%U:%G\' '
+            '/run/caddy)" = caddy:caddy',
+            plan,
+        )
+        self.assertIn("8#$caddy_runtime_mode & 0022", plan)
+        self.assertIn("sport = :2019", plan)
+        self.assertIn('test "$(command -v ss)" = /usr/bin/ss', plan)
+        self.assertIn(
+            'admin_port_pipeline_status=("${PIPESTATUS[@]}")', plan
+        )
+        self.assertIn("admin_port_source_status", plan)
+        self.assertIn("caddy_admin_tcp_2019=absent", plan)
+        self.assertIn("eryu_template_install=failed", plan)
+        self.assertIn('test ! -L "$install_target"', plan)
+        self.assertIn(
+            "/etc/systemd/system/caddy.service.d/eryu-credentials.conf "
+            "|| eryu_template_install_failed",
+            plan,
+        )
+        self.assertIn("eryu_public_cutover=failed", plan)
+        web_health = plan.index(
+            "/usr/bin/curl --fail --silent --show-error "
+            "http://127.0.0.1:9090/health"
+        )
+        mcp_start = plan.index(
+            "/usr/bin/systemctl enable --now eryu-mcp.service"
+        )
+        mcp_health = plan.index(
+            "/usr/bin/curl --fail --silent --show-error --output /dev/null "
+            "http://127.0.0.1:9091/.well-known/oauth-protected-resource"
+        )
+        self.assertLess(web_health, mcp_start)
+        self.assertLess(mcp_start, mcp_health)
+        self.assertLess(mcp_health, final_reload)
+        self.assertIn(
+            "/usr/bin/systemctl reload caddy.service || "
+            "eryu_public_cutover_failed",
+            plan,
+        )
+        self.assertIn(
+            "/etc/credstore.encrypted/eryu/MUSIC_U.cred \\",
+            plan,
+        )
+        self.assertIn('test ! -e "$credential_target"', plan)
+        self.assertIn('test ! -L "$credential_target"', plan)
+        self.assertIn(
+            "for credential_directory in /etc/credstore.encrypted "
+            "/etc/credstore.encrypted/eryu",
+            plan,
+        )
+        self.assertIn(
+            "stat -c '%U:%G:%a' \"$credential_directory\")\" = "
+            "root:root:700",
+            plan,
+        )
+
+    def test_caddy_candidate_is_validated_before_atomic_live_replacement(self) -> None:
+        plan = self.read("README.md")
+        validate_candidate = plan.index(
+            "/usr/bin/caddy validate --config "
+            "/etc/caddy/.Caddyfile.eryu-candidate"
+        )
+        copy_candidate = plan.index(
+            "/usr/bin/sudo /usr/bin/cp --preserve=mode,ownership,timestamps "
+            "/var/backups/eryu-deploy/Caddyfile.expected-eryu "
+            "/etc/caddy/.Caddyfile.eryu-candidate"
+        )
+        atomic_replace = plan.index(
+            "/usr/bin/sudo /usr/bin/mv -T /etc/caddy/.Caddyfile.eryu-candidate "
+            "/etc/caddy/Caddyfile"
+        )
+        self.assertLess(copy_candidate, validate_candidate)
+        self.assertLess(validate_candidate, atomic_replace)
+        self.assertIn("eryu_caddy_route_install=failed", plan)
+        self.assertIn(
+            "/usr/bin/caddy validate --config "
+            "/etc/caddy/.Caddyfile.eryu-candidate --adapter caddyfile "
+            "|| caddy_route_install_failed",
+            plan,
+        )
+        live_unchanged = plan.index(
+            "/usr/bin/sudo /usr/bin/cmp --silent "
+            "/var/backups/eryu-deploy/Caddyfile.pre-eryu "
+            "/etc/caddy/Caddyfile || caddy_route_install_failed"
+        )
+        self.assertLess(validate_candidate, live_unchanged)
+        self.assertLess(live_unchanged, atomic_replace)
+        self.assertIn(
+            "/usr/bin/sudo /usr/bin/test ! -L /etc/caddy/Caddyfile", plan
+        )
+        self.assertIn(
+            "/usr/bin/sudo /usr/bin/test ! -L "
+            "/etc/caddy/.Caddyfile.eryu-candidate",
+            plan,
+        )
+        self.assertIn(
+            "/usr/bin/sudo /usr/bin/test ! -L /etc/caddy/eryu.caddy", plan
+        )
+        self.assertIn(
+            "test \"$((8#$caddy_dir_mode & 0022))\" -eq 0", plan
+        )
+        self.assertNotIn("tee -a /etc/caddy/Caddyfile", plan)
+
+    def test_caddy_route_rollback_is_validated_before_atomic_replacement(self) -> None:
+        plan = self.read("README.md")
+        rollback_validate = plan.index("--unit=eryu-caddy-rollback-validate")
+        rollback_replace = plan.index(
+            "/usr/bin/sudo /usr/bin/mv -T /etc/caddy/.Caddyfile.eryu-rollback "
+            "/etc/caddy/Caddyfile"
+        )
+        rollback_delete_fragment = plan.index(
+            "/usr/bin/sudo /usr/bin/rm -f /etc/caddy/eryu.caddy"
+        )
+        self.assertLess(rollback_validate, rollback_replace)
+        self.assertLess(rollback_replace, rollback_delete_fragment)
+        self.assertIn("eryu_caddy_route_rollback=failed", plan)
+        self.assertIn(
+            "/usr/bin/caddy validate --config "
+            "/etc/caddy/.Caddyfile.eryu-rollback --adapter caddyfile "
+            "|| caddy_route_rollback_failed",
+            plan,
+        )
+        rollback_live_approved = plan.index(
+            "/usr/bin/sudo /usr/bin/cmp --silent "
+            "/var/backups/eryu-deploy/Caddyfile.expected-eryu "
+            "/etc/caddy/Caddyfile || caddy_route_rollback_failed"
+        )
+        self.assertLess(rollback_validate, rollback_live_approved)
+        self.assertLess(rollback_live_approved, rollback_replace)
+        self.assertIn(
+            "/usr/bin/sudo /usr/bin/test ! -L "
+            "/etc/caddy/.Caddyfile.eryu-rollback",
+            plan,
+        )
+        self.assertGreaterEqual(
+            plan.count(
+                'test "$(/usr/bin/sudo /usr/bin/stat -c \'%U:%G\' '
+                '/etc/caddy)" '
+                "= root:root"
+            ),
+            2,
+        )
+
+    def test_bash_pipeline_status_is_snapshotted_before_indexing(self) -> None:
+        if os.name == "nt":
+            program_files = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
+            bash = program_files / "Git/bin/bash.exe"
+            bash_path = str(bash) if bash.is_file() else None
+        else:
+            bash_path = shutil.which("bash")
+        if not bash_path:
+            self.skipTest("Bash is unavailable")
+
+        script = r'''
+printf '%s\n' safe | grep -Ei 'TOKEN=' > /dev/null
+pipeline_status=("${PIPESTATUS[@]}")
+source_status=${pipeline_status[0]}
+match_status=${pipeline_status[1]}
+test "$source_status" -eq 0
+test "$match_status" -eq 1
+
+printf '%s\n' 'TOKEN=sentinel' | grep -Ei 'TOKEN=' > /dev/null
+pipeline_status=("${PIPESTATUS[@]}")
+source_status=${pipeline_status[0]}
+match_status=${pipeline_status[1]}
+test "$source_status" -eq 0
+test "$match_status" -eq 0
+'''
+        completed = subprocess.run(
+            [bash_path, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+
+    def test_documented_bash_blocks_are_syntactically_valid(self) -> None:
+        if os.name == "nt":
+            program_files = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
+            bash = program_files / "Git/bin/bash.exe"
+            bash_path = str(bash) if bash.is_file() else None
+        else:
+            bash_path = shutil.which("bash")
+        if not bash_path:
+            self.skipTest("Bash is unavailable")
+
+        fence = re.compile(
+            r"(?ms)^[ \t]*```bash[ \t]*\r?\n(.*?)^[ \t]*```[ \t]*$"
+        )
+        for relative_path in ("README.md", "CADDY-UPGRADE.md"):
+            blocks = fence.findall(self.read(relative_path))
+            self.assertTrue(blocks, relative_path)
+            for index, block in enumerate(blocks, 1):
+                with self.subTest(path=relative_path, block=index):
+                    completed = subprocess.run(
+                        [bash_path, "-n"],
+                        input=block,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(
+                        completed.returncode,
+                        0,
+                        f"{relative_path} block {index}: {completed.stderr}",
+                    )
 
     def test_units_invoke_the_non_secret_wrapper_and_not_a_shell_command_string(self) -> None:
         expected = "/usr/local/libexec/eryu-run-with-credentials"
@@ -190,13 +586,14 @@ class DeploymentTemplateTest(unittest.TestCase):
         self.assertIn("/opt/eryu/venv/bin/python -m pip check", plan)
         self.assertIn("Caddyfile.pre-eryu", plan)
         self.assertIn("Caddyfile.expected-eryu", plan)
-        self.assertIn("sudo cmp --silent", plan)
-        self.assertNotIn("sudo diff", plan)
+        self.assertIn("/usr/bin/sudo /usr/bin/cmp --silent", plan)
+        self.assertNotIn("/usr/bin/sudo /usr/bin/diff", plan)
         self.assertNotIn("sudoedit /etc/caddy/Caddyfile", plan)
         self.assertIn("不表示网络隔离", plan)
         self.assertIn("ERYU_BASIC_AUTH_ENTRY", plan)
         self.assertIn("/health", plan)
-        self.assertIn("basicauth", plan)
+        self.assertIn("basic_auth", plan)
+        self.assertIn("CADDY-UPGRADE.md", plan)
         self.assertNotIn("数字 MP3 边界", plan)
 
 
