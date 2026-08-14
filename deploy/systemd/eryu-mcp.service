@@ -1,0 +1,50 @@
+[Unit]
+Description=Eryu read-only HTTPS MCP upstream
+Wants=network-online.target
+After=network-online.target eryu-web.service
+Requires=eryu-web.service
+
+[Service]
+Type=simple
+User=eryu-mcp
+Group=eryu-mcp
+WorkingDirectory=/opt/eryu/current
+UMask=0077
+
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=ERYU_BASE_URL=http://127.0.0.1:9090
+Environment=MCP_HTTP_HOST=127.0.0.1
+Environment=MCP_HTTP_PORT=9091
+Environment=MCP_PUBLIC_URL=https://eryu-mcp.95.169.17.214.sslip.io
+Environment=AUTH0_AUDIENCE=https://eryu-mcp.95.169.17.214.sslip.io
+Environment=MCP_REQUIRED_SCOPE=music:read
+EnvironmentFile=/etc/eryu/auth0-public.conf
+LoadCredentialEncrypted=ERYU_MCP_READ_TOKEN:/etc/credstore.encrypted/eryu/ERYU_MCP_READ_TOKEN.cred
+ExecStart=/usr/local/libexec/eryu-run-with-credentials mcp
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

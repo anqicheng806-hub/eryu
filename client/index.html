@@ -492,7 +492,8 @@ img { display: block; }
    ═══════════════════════════════════════════ */
 
 // ── Auth ──
-function auth() { return localStorage.getItem('eryu_token') || ''; }
+let sessionAuthToken = '';
+function auth() { return sessionAuthToken; }
 function authHeaders() { return { 'X-Auth-Token': auth() }; }
 function jsonHeaders() { return { 'Content-Type': 'application/json', 'X-Auth-Token': auth() }; }
 
@@ -501,8 +502,13 @@ async function api(path, opts) {
   const res = await fetch(path, { ...opts, headers: { ...authHeaders(), ...(opts?.headers || {}) } });
   return res.json();
 }
-async function apiPost(path, body) {
-  return api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+async function apiPost(path, body, opts = {}) {
+  return api(path, {
+    ...opts,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+    body: JSON.stringify(body)
+  });
 }
 
 // ── Toast ──
@@ -543,6 +549,7 @@ audio.preload = 'auto';
 const state = {
   song: null,       // { name, artist, cover, songId, album }
   playing: false,
+  playbackStatus: 'idle',
   progress: 0,      // 0..1
   currentTime: 0,
   duration: 0,
@@ -558,17 +565,50 @@ function notifySong() { state.songListeners.forEach(fn => fn(state.song)); }
 function onAudioChange(fn) { state.listeners.add(fn); return () => state.listeners.delete(fn); }
 function onSongChange(fn) { state.songListeners.add(fn); return () => state.songListeners.delete(fn); }
 
+function syncAudioTiming() {
+  state.currentTime = Number.isFinite(audio.currentTime) && audio.currentTime >= 0 ? audio.currentTime : 0;
+  state.duration = Number.isFinite(audio.duration) && audio.duration >= 0 ? audio.duration : 0;
+  state.progress = state.duration ? Math.max(0, Math.min(1, state.currentTime / state.duration)) : 0;
+}
+
 audio.addEventListener('timeupdate', () => {
-  state.currentTime = audio.currentTime;
-  state.duration = audio.duration || 0;
-  state.progress = state.duration ? audio.currentTime / state.duration : 0;
+  syncAudioTiming();
   notify();
 });
-audio.addEventListener('play', () => { state.playing = true; notify(); });
-audio.addEventListener('pause', () => { state.playing = false; notify(); });
+audio.addEventListener('loadedmetadata', () => {
+  syncAudioTiming();
+  notify();
+  reportPresence();
+});
+audio.addEventListener('play', () => {
+  state.playing = true;
+  state.playbackStatus = 'playing';
+  notify();
+  reportPresence();
+});
+audio.addEventListener('pause', () => {
+  state.playing = false;
+  if (audio.ended) {
+    state.playbackStatus = 'ended';
+  } else if (state.playbackStatus !== 'loading' && state.playbackStatus !== 'error') {
+    state.playbackStatus = state.song ? 'paused' : 'idle';
+  }
+  notify();
+  reportPresence();
+});
+audio.addEventListener('error', () => {
+  state.playing = false;
+  state.playbackStatus = state.song ? 'error' : 'idle';
+  syncAudioTiming();
+  notify();
+  reportPresence();
+});
 audio.addEventListener('ended', () => {
   state.playing = false;
+  state.playbackStatus = 'ended';
+  syncAudioTiming();
   notify();
+  reportPresence();
   if (state.song) {
     apiPost('/music/listen-complete', {
       songId: state.song.songId,
@@ -579,18 +619,48 @@ audio.addEventListener('ended', () => {
   playNext();
 });
 
+let audioLoadRequestId = 0;
+
 async function loadAndPlay(song) {
   if (!song || !song.songId) return;
+  const requestId = ++audioLoadRequestId;
+
+  audio.pause();
+  audio.removeAttribute('src');
+  audio.load();
   state.song = song;
+  state.playing = false;
+  state.playbackStatus = 'loading';
+  state.currentTime = 0;
+  state.duration = 0;
+  state.progress = 0;
+  reportPresence({ preempt: true });
   notifySong();
+  notify();
+
   try {
-    const d = await api('/music/url?id=' + song.songId);
+    const d = await api('/music/url?id=' + encodeURIComponent(song.songId));
+    if (requestId !== audioLoadRequestId) return;
     if (d.url) {
       audio.src = d.url;
-      audio.play().catch(() => {});
+      audio.play().catch(() => {
+        if (requestId !== audioLoadRequestId || state.playbackStatus === 'error') return;
+        state.playing = false;
+        state.playbackStatus = 'paused';
+        notify();
+        reportPresence();
+      });
+    } else {
+      state.playbackStatus = 'error';
+      notify();
+      reportPresence();
     }
-  } catch (e) {
-    console.error('loadAndPlay error', e);
+  } catch {
+    if (requestId !== audioLoadRequestId) return;
+    state.playing = false;
+    state.playbackStatus = 'error';
+    notify();
+    reportPresence();
   }
 }
 
@@ -654,7 +724,11 @@ let playlistDetail = null; // playlist meta object or null
 // ── Re-render on audio change ──
 let npBarEl = null;
 onAudioChange(() => { renderNpBar(); renderLyricsProgress(); });
-onSongChange(() => { renderNpBar(); loadLyrics(); });
+onSongChange(() => {
+  renderNpBar();
+  if (lyricsOpen) renderLyricsView();
+  loadLyrics();
+});
 
 // ── Auth check + initial render ──
 function init() {
@@ -669,15 +743,19 @@ function renderAuth() {
   document.getElementById('app').innerHTML = `
     <div class="auth-overlay">
       <h2>eryu</h2>
-      <input id="auth-input" type="text" placeholder="enter access token..." autocomplete="off" />
+      <input id="auth-input" type="password" placeholder="enter access token..." autocomplete="off" spellcheck="false" />
       <button id="auth-btn">Enter</button>
     </div>`;
   document.getElementById('auth-btn').onclick = () => {
-    const val = document.getElementById('auth-input').value.trim();
-    if (val) {
-      localStorage.setItem('eryu_token', val);
-      renderApp();
+    const val = document.getElementById('auth-input').value;
+    if (val.length < 32 || /\s/.test(val)) {
+      showToast('Token must be at least 32 characters with no spaces');
+      return;
     }
+    sessionAuthToken = val;
+    document.getElementById('auth-input').value = '';
+    renderApp();
+    reportPresence();
   };
   document.getElementById('auth-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') document.getElementById('auth-btn').click();
@@ -1342,6 +1420,9 @@ function renderNpBar() {
 let lyricLines = [];
 let lyricTransMap = new Map();
 let currentLyricIdx = -1;
+let lyricsForSongId = null;
+let lyricsStatus = 'idle';
+let lyricsLoadRequestId = 0;
 let lyricsDragging = false;
 let lyricsDragRatio = 0;
 let lyricsLineEls = [];
@@ -1473,27 +1554,73 @@ function updateSeekUI(ratio) {
 
 async function loadLyrics() {
   const s = state.song;
-  if (!s?.songId) return;
+  if (!s?.songId) {
+    lyricsLoadRequestId++;
+    lyricsForSongId = null;
+    lyricsStatus = 'idle';
+    lyricLines = [];
+    lyricTransMap = new Map();
+    currentLyricIdx = -1;
+    lyricsLineEls = [];
+    renderLyricLines();
+    reportPresence();
+    return;
+  }
 
+  const songId = String(s.songId);
+  if (lyricsForSongId === songId && lyricsStatus === 'loading') return;
+  if (lyricsForSongId === songId && (lyricsStatus === 'ready' || lyricsStatus === 'none')) {
+    renderLyricLines();
+    renderLyricsProgress();
+    return;
+  }
+
+  const requestId = ++lyricsLoadRequestId;
+  lyricsForSongId = songId;
+  lyricsStatus = 'loading';
   lyricLines = [];
   lyricTransMap = new Map();
   currentLyricIdx = -1;
+  lyricsLineEls = [];
+  renderLyricLines();
+  reportPresence();
 
   try {
-    const d = await api('/music/lyric?id=' + s.songId);
-    if (d.ok && d.lrc) lyricLines = parseLrc(d.lrc);
+    const d = await api('/music/lyric?id=' + encodeURIComponent(songId));
+    if (requestId !== lyricsLoadRequestId || String(state.song?.songId || '') !== songId) return;
+    if (!d.ok) throw new Error('lyrics unavailable');
+
+    const nextLines = d.lrc ? parseLrc(d.lrc) : [];
+    const nextTransMap = new Map();
     if (d.tlyric) {
       const tLines = parseLrc(d.tlyric);
-      for (const tl of tLines) lyricTransMap.set(Math.round(tl.time * 100), tl.text);
+      for (const tl of tLines) nextTransMap.set(Math.round(tl.time * 100), tl.text);
     }
-  } catch {}
+
+    lyricLines = nextLines;
+    lyricTransMap = nextTransMap;
+    lyricsStatus = lyricLines.length > 0 ? 'ready' : 'none';
+  } catch {
+    if (requestId !== lyricsLoadRequestId || String(state.song?.songId || '') !== songId) return;
+    lyricLines = [];
+    lyricTransMap = new Map();
+    lyricsStatus = 'error';
+  }
 
   renderLyricLines();
+  renderLyricsProgress();
+  reportPresence();
 }
 
 function renderLyricLines() {
   const container = document.getElementById('ly-lines-container');
   if (!container) return;
+
+  if (lyricsStatus === 'loading') {
+    container.innerHTML = '<div class="ly-loading">loading lyrics...</div>';
+    lyricsLineEls = [];
+    return;
+  }
 
   if (lyricLines.length === 0) {
     container.innerHTML = '<div class="ly-no-lyrics">no lyrics available</div>';
@@ -1518,6 +1645,162 @@ function renderLyricLines() {
   });
 }
 
+function findCurrentLyricIndex(timeSeconds) {
+  for (let i = lyricLines.length - 1; i >= 0; i--) {
+    if (timeSeconds >= lyricLines[i].time) return i;
+  }
+  return -1;
+}
+
+function presenceNumber(value) {
+  return Number.isFinite(value) && value >= 0 ? Math.round(value * 1000) / 1000 : 0;
+}
+
+function presenceText(value, maxLength) {
+  return String(value || '').slice(0, maxLength);
+}
+
+function presenceLyricLine(line, index) {
+  if (!line) return null;
+  return {
+    index,
+    timeSeconds: presenceNumber(line.time),
+    text: presenceText(line.text, 2000),
+    translation: presenceText(lyricTransMap.get(Math.round(line.time * 100)), 2000),
+  };
+}
+
+function buildPresenceLyrics() {
+  const songId = state.song?.songId ? String(state.song.songId) : null;
+  const matchesSong = songId !== null && lyricsForSongId === songId;
+  const status = songId === null ? 'idle' : (matchesSong ? lyricsStatus : 'loading');
+  const empty = {
+    songId,
+    status,
+    currentIndex: -1,
+    current: null,
+    previous: [],
+    next: [],
+  };
+
+  if (!matchesSong || lyricsStatus !== 'ready' || lyricLines.length === 0) return empty;
+
+  const currentIndex = findCurrentLyricIndex(state.currentTime);
+  const previousStart = currentIndex < 0 ? 0 : Math.max(0, currentIndex - 2);
+  const previous = currentIndex < 0
+    ? []
+    : lyricLines.slice(previousStart, currentIndex)
+      .map((line, offset) => presenceLyricLine(line, previousStart + offset));
+  const nextStart = currentIndex < 0 ? 0 : currentIndex + 1;
+  const next = lyricLines.slice(nextStart, nextStart + 2)
+    .map((line, offset) => presenceLyricLine(line, nextStart + offset));
+
+  return {
+    songId,
+    status,
+    currentIndex,
+    current: currentIndex >= 0 ? presenceLyricLine(lyricLines[currentIndex], currentIndex) : null,
+    previous,
+    next,
+  };
+}
+
+const presenceClientSessionId = globalThis.crypto?.randomUUID
+  ? globalThis.crypto.randomUUID()
+  : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+let presenceSequence = 0;
+let presenceTimer = null;
+
+function buildPresencePayload(sequence) {
+  const s = state.song;
+  const song = s ? {
+    songId: String(s.songId || ''),
+    name: presenceText(s.name, 512),
+    artist: presenceText(s.artist, 512),
+    album: presenceText(s.album, 512),
+    cover: presenceText(s.cover, 2048),
+  } : null;
+
+  return {
+    schemaVersion: 1,
+    clientSessionId: presenceClientSessionId,
+    sequence,
+    reportedAt: new Date().toISOString(),
+    song,
+    playback: {
+      status: song ? state.playbackStatus : 'idle',
+      playing: Boolean(song && state.playbackStatus === 'playing' && state.playing),
+      positionSeconds: presenceNumber(state.currentTime),
+      durationSeconds: presenceNumber(state.duration),
+      progressRatio: Math.max(0, Math.min(1, presenceNumber(state.progress))),
+    },
+    lyrics: buildPresenceLyrics(),
+  };
+}
+
+// PRESENCE_REPORTER_CORE_START
+function createPresenceReporter({
+  hasAuth,
+  buildSnapshot,
+  sendSnapshot,
+  timeoutMs = 5000,
+  createAbortController = () => new AbortController(),
+  scheduleTimeout = (callback, delay) => setTimeout(callback, delay),
+  cancelTimeout = timeout => clearTimeout(timeout),
+}) {
+  let inFlight = null;
+  let pending = false;
+
+  async function sendPending() {
+    if (inFlight !== null || !pending || !hasAuth()) return;
+
+    pending = false;
+    const controller = createAbortController();
+    const activeRequest = { controller };
+    inFlight = activeRequest;
+    const timeout = scheduleTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      await sendSnapshot(buildSnapshot(), { signal: controller.signal });
+    } catch {
+      // Best-effort only. A trailing send happens only when a newer event is pending.
+    } finally {
+      cancelTimeout(timeout);
+      if (inFlight === activeRequest) inFlight = null;
+      if (pending && hasAuth()) void sendPending();
+    }
+  }
+
+  function request({ preempt = false } = {}) {
+    if (!hasAuth()) return;
+    pending = true;
+    if (inFlight !== null) {
+      if (preempt) inFlight.controller.abort();
+      return;
+    }
+    void sendPending();
+  }
+
+  return { request };
+}
+// PRESENCE_REPORTER_CORE_END
+
+const presenceReporter = createPresenceReporter({
+  hasAuth: () => Boolean(auth()),
+  buildSnapshot: () => buildPresencePayload(++presenceSequence),
+  sendSnapshot: (payload, options) => apiPost('/music/presence', payload, options),
+});
+
+function reportPresence(options) {
+  presenceReporter.request(options);
+}
+
+function startPresenceReporting() {
+  if (presenceTimer !== null) return;
+  presenceTimer = setInterval(reportPresence, 2000);
+  reportPresence();
+}
+
 function renderLyricsProgress() {
   if (!lyricsOpen) return;
 
@@ -1537,11 +1820,8 @@ function renderLyricsProgress() {
   if (timeTotal) timeTotal.textContent = fmt(state.duration);
 
   // Update current lyric highlight
-  if (lyricLines.length > 0) {
-    let idx = -1;
-    for (let i = lyricLines.length - 1; i >= 0; i--) {
-      if (state.currentTime >= lyricLines[i].time) { idx = i; break; }
-    }
+  if (lyricsForSongId === String(state.song?.songId || '') && lyricsStatus === 'ready' && lyricLines.length > 0) {
+    const idx = findCurrentLyricIndex(state.currentTime);
     if (idx !== currentLyricIdx) {
       currentLyricIdx = idx;
       lyricsLineEls.forEach((el, i) => {
@@ -1642,15 +1922,9 @@ function renderMemory(mv, mem, songId) {
 // ══════════════════════════════════════════
 // ── Song change => update lyrics view ──
 // ══════════════════════════════════════════
-onSongChange(() => {
-  if (lyricsOpen) {
-    renderLyricsView();
-    loadLyrics();
-  }
-});
-
 // ── Init ──
 init();
+startPresenceReporting();
 </script>
 </body>
 </html>

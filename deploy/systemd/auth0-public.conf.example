@@ -1,0 +1,3 @@
+# Public metadata only. Never put a token, MUSIC_U, or client secret here.
+# Keep the trailing slash required by the Auth0 issuer identifier.
+AUTH0_ISSUER_URL=https://YOUR_AUTH0_TENANT.us.auth0.com/

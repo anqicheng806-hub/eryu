@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eryu-music-presence-mcp"
+version = "0.1.0"
+description = "Read-only MCP presence tools for the eryu music player"
+requires-python = ">=3.10"
+dependencies = [
+  "mcp==2.0.0",
+  "PyJWT[crypto]==2.13.0",
+  "cryptography==50.0.0",
+]
+
+[project.scripts]
+eryu-music-mcp = "mcp_server.eryu_music_mcp:main"
+eryu-music-mcp-http = "mcp_server.eryu_music_http:main"
+
+[tool.setuptools]
+packages = ["mcp_server"]
+package-dir = {mcp_server = "."}

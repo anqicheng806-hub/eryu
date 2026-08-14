@@ -1,0 +1,5 @@
+# Deployment artifacts are consumed directly by Linux services.
+*.sh text eol=lf
+*.service text eol=lf
+*.caddy text eol=lf
+deploy/systemd/*.conf text eol=lf

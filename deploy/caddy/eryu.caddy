@@ -1,0 +1,55 @@
+# Private test web player. Caddy terminates HTTPS and the Python server remains
+# bound to loopback, so ports 9090/9091 must not be opened in the firewall.
+# Caddy 2.6.x uses the legacy directive spelling "basicauth". The imported
+# account line is supplied as an encrypted systemd credential at service start.
+eryu.95.169.17.214.sslip.io {
+	handle /health {
+		header {
+			-Server
+			Cache-Control "no-store"
+			Content-Type "text/plain; charset=utf-8"
+		}
+		respond "ok" 200
+	}
+
+	handle {
+		basicauth {
+			import {$CREDENTIALS_DIRECTORY}/ERYU_BASIC_AUTH_ENTRY
+		}
+
+		encode zstd gzip
+
+		reverse_proxy 127.0.0.1:9090 {
+			header_up -Authorization
+		}
+	}
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=86400"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+}
+
+# ChatGPT connects to the canonical Streamable HTTP endpoint ending in /mcp.
+# Only MCP and its RFC 9728 protected-resource metadata endpoint are exposed.
+eryu-mcp.95.169.17.214.sslip.io {
+	@mcp_endpoints path /mcp /.well-known/oauth-protected-resource
+
+	handle @mcp_endpoints {
+		reverse_proxy 127.0.0.1:9091
+	}
+
+	handle {
+		respond "Not Found" 404
+	}
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=86400"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+}

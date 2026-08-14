@@ -27,21 +27,28 @@ Data layout:
     ./data/music_memory.json — per-song memory (notes, listen counts)
     ./data/music_playlist.json — legacy flat playlist (synced with liked)
     ./data/music_remote.json — ephemeral remote-play payload
-    ./.secret              — auto-generated auth token
-    ./.netease_cred        — MUSIC_U=<cookie> (one line)
+Environment:
+    ERYU_HOST                  - IPv4 listen address (default: 127.0.0.1)
+    ERYU_PORT                  - listen port (default: 9090; PORT is legacy)
+    ERYU_DATA_DIR              - absolute persistent data directory
+    ERYU_ALLOWED_ORIGIN        - exact web origin (default: * for local use)
+    ERYU_AUTH_TOKEN            — full-access API token (required)
+    ERYU_MCP_READ_TOKEN         — read-only MCP token (required, must differ)
+    MUSIC_U                    — NetEase cookie value (optional)
+    MUSIC_PRESENCE_TTL_SECONDS — presence freshness TTL (default: 10)
 """
 from __future__ import annotations
 
+import hmac
 import json
 import logging
+import math
 import mimetypes
 import os
 import random
 import re
-import secrets
 import subprocess
 import sys
-import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -51,6 +58,23 @@ from typing import Any
 from urllib.parse import urlparse, parse_qs, urlencode
 import urllib.request
 import urllib.error
+
+try:
+    from .presence import (
+        PresenceStore,
+        PresenceSequenceError,
+        PresenceValidationError,
+        is_valid_song_id,
+        parse_presence_ttl,
+    )
+except ImportError:  # Running as ``python server/eryu.py``.
+    from presence import (
+        PresenceStore,
+        PresenceSequenceError,
+        PresenceValidationError,
+        is_valid_song_id,
+        parse_presence_ttl,
+    )
 
 HERE = Path(__file__).resolve().parent
 
@@ -63,21 +87,218 @@ logger = logging.getLogger("eryu")
 
 # ── Secret management ────────────────────────────────────────────────────────
 
-def _load_or_create_secret() -> str:
-    secret_file = HERE / ".secret"
+MAX_JSON_BODY_BYTES = 64 * 1024
+MAX_SPECTROGRAM_BYTES = 8 * 1024 * 1024
+ANALYZER_ENV_ALLOWLIST = frozenset(
+    {
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "TZ",
+        "WINDIR",
+    }
+)
+MCP_READ_PATHS = frozenset(
+    {
+        "/music/presence",
+        "/music/analyze/status",
+        "/music/analyze/spectrogram",
+        "/music/memory",
+    }
+)
+
+
+def _analyzer_environment(cache_dir: Path) -> dict[str, str]:
+    """Build a minimal child environment without any API token or cookie."""
+
+    runtime_cache = cache_dir / ".analysis_runtime"
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() in ANALYZER_ENV_ALLOWLIST and value
+    }
+    environment.update(
+        {
+            "HOME": str(runtime_cache / "home"),
+            "MPLCONFIGDIR": str(cache_dir / ".matplotlib"),
+            "NUMBA_CACHE_DIR": str(cache_dir / ".numba"),
+            "PYTHONNOUSERSITE": "1",
+            "XDG_CACHE_HOME": str(runtime_cache / "cache"),
+            "XDG_CONFIG_HOME": str(runtime_cache / "config"),
+        }
+    )
+    if os.name == "nt":
+        environment.update(
+            {
+                "APPDATA": str(runtime_cache / "appdata"),
+                "LOCALAPPDATA": str(runtime_cache / "localappdata"),
+                "PROGRAMDATA": str(runtime_cache / "programdata"),
+            }
+        )
+    return environment
+
+
+class RequestBodyError(ValueError):
+    def __init__(self, status: int, message: str, *, close_connection: bool = False):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.close_connection = close_connection
+
+
+def _parse_server_host(value: str | None) -> str:
+    """Keep the player backend pinned to the exact loopback address."""
+    if value is None:
+        return "127.0.0.1"
+    if value != "127.0.0.1":
+        raise ValueError("ERYU_HOST must be exactly 127.0.0.1")
+    return value
+
+
+def _parse_server_port(value: str | None) -> int:
+    """Parse a decimal TCP port without accepting whitespace or sign prefixes."""
+    if value is None:
+        return 9090
+    if not re.fullmatch(r"[1-9][0-9]{0,4}", value):
+        raise ValueError("ERYU_PORT (or legacy PORT) must be an integer from 1 to 65535")
+    port = int(value)
+    if port > 65535:
+        raise ValueError("ERYU_PORT (or legacy PORT) must be an integer from 1 to 65535")
+    return port
+
+
+def _load_server_port() -> int:
+    """Prefer ERYU_PORT while retaining the project's legacy PORT setting."""
+    value = os.environ.get("ERYU_PORT")
+    if value is None:
+        value = os.environ.get("PORT")
+    return _parse_server_port(value)
+
+
+def _parse_data_dir(value: str | None) -> Path:
+    """Resolve the configured persistent directory without relying on the CWD."""
+    if value is None:
+        return (HERE / "data").resolve()
+    if not value or value != value.strip() or "\x00" in value:
+        raise ValueError("ERYU_DATA_DIR must be a non-empty absolute path")
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError("ERYU_DATA_DIR must be an absolute path")
+    return path.resolve()
+
+
+def _parse_allowed_origin(value: str | None) -> str:
+    """Accept one exact HTTP(S) origin; retain ``*`` only as the local default."""
+    if value is None or value == "*":
+        return "*"
+    if not value or value != value.strip() or any(char.isspace() for char in value):
+        raise ValueError("ERYU_ALLOWED_ORIGIN must be one exact HTTP(S) origin")
+    parsed = urlparse(value)
     try:
-        if secret_file.exists():
-            s = secret_file.read_text().strip()
-            if s:
-                return s
-        new_secret = secrets.token_hex(32)
-        secret_file.write_text(new_secret)
-        secret_file.chmod(0o600)
-        logger.info("Auto-generated shared secret saved to %s", secret_file)
-        return new_secret
-    except Exception as e:
-        logger.warning("Could not auto-generate secret: %s", e)
-        return ""
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise ValueError("ERYU_ALLOWED_ORIGIN has an invalid port") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or (parsed_port is not None and not (1 <= parsed_port <= 65535))
+    ):
+        raise ValueError("ERYU_ALLOWED_ORIGIN must be one exact HTTP(S) origin")
+    return value
+
+
+def _load_auth_tokens() -> tuple[str, str]:
+    full_token = os.environ.get("ERYU_AUTH_TOKEN", "")
+    read_token = os.environ.get("ERYU_MCP_READ_TOKEN", "")
+    if (
+        not full_token
+        or full_token != full_token.strip()
+        or len(full_token) < 32
+        or any(char.isspace() for char in full_token)
+    ):
+        raise RuntimeError(
+            "ERYU_AUTH_TOKEN must be a non-whitespace value of at least 32 characters"
+        )
+    if (
+        not read_token
+        or read_token != read_token.strip()
+        or len(read_token) < 32
+        or any(char.isspace() for char in read_token)
+    ):
+        raise RuntimeError(
+            "ERYU_MCP_READ_TOKEN must be a non-whitespace value of at least 32 characters"
+        )
+    if hmac.compare_digest(full_token, read_token):
+        raise RuntimeError("ERYU_AUTH_TOKEN and ERYU_MCP_READ_TOKEN must differ")
+    return full_token, read_token
+
+
+def _safe_analysis_number(value: Any) -> float | int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return value
+
+
+def _sanitize_analysis_result(
+    result: Any, song_id: str, *, spectrogram_available: bool
+) -> dict[str, Any] | None:
+    """Return only stable analysis fields; never expose cache filesystem paths."""
+    if not isinstance(result, dict):
+        return None
+    sanitized: dict[str, Any] = {
+        "songId": song_id,
+        "name": result.get("name", "") if isinstance(result.get("name", ""), str) else "",
+        "artist": (
+            result.get("artist", "") if isinstance(result.get("artist", ""), str) else ""
+        ),
+        "spectrogramAvailable": spectrogram_available,
+    }
+    sanitized["name"] = sanitized["name"][:512]
+    sanitized["artist"] = sanitized["artist"][:512]
+    for key in ("duration", "bpm"):
+        number = _safe_analysis_number(result.get(key))
+        if number is not None and number >= 0:
+            sanitized[key] = number
+    key_name = result.get("key")
+    if isinstance(key_name, str):
+        sanitized["key"] = key_name[:32]
+
+    segments: list[dict[str, float | int]] = []
+    raw_segments = result.get("segments")
+    if isinstance(raw_segments, list):
+        for raw_segment in raw_segments[:64]:
+            if not isinstance(raw_segment, dict):
+                continue
+            segment: dict[str, float | int] = {}
+            valid = True
+            for field in ("start", "end", "avgEnergy", "maxEnergy"):
+                number = _safe_analysis_number(raw_segment.get(field))
+                if number is None or number < 0:
+                    valid = False
+                    break
+                segment[field] = number
+            if valid:
+                segments.append(segment)
+    sanitized["segments"] = segments
+    return sanitized
 
 
 # ── Request handler ──────────────────────────────────────────────────────────
@@ -88,28 +309,82 @@ class EryuHandler(BaseHTTPRequestHandler):
     server_version = "Eryu/1.0"
 
     def log_message(self, fmt, *args):
-        logger.info("%s %s", self.address_string(), fmt % args)
+        # Never log query strings: legacy ``?token=`` requests must not leak
+        # credentials even though query-parameter authentication is rejected.
+        status = str(args[1]) if len(args) > 1 else "-"
+        logger.info(
+            "%s %s %s %s",
+            self.address_string(),
+            getattr(self, "command", "-"),
+            urlparse(getattr(self, "path", "")).path,
+            status,
+        )
 
     # ── Helpers ──
 
     def _read_body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", 0))
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError) as exc:
+            raise RequestBodyError(400, "invalid Content-Length") from exc
+        if length < 0:
+            raise RequestBodyError(400, "invalid Content-Length")
+        if length > MAX_JSON_BODY_BYTES:
+            raise RequestBodyError(413, "request body too large", close_connection=True)
         if not length:
             return {}
+        content_type = self.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+        if content_type != "application/json":
+            raise RequestBodyError(415, "Content-Type must be application/json")
         raw = self.rfile.read(length)
-        return json.loads(raw)
+        try:
+            body = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            raise RequestBodyError(400, "invalid JSON body") from exc
+        if not isinstance(body, dict):
+            raise RequestBodyError(400, "JSON body must be an object")
+        return body
 
-    def _check_auth(self) -> bool:
-        if not self.state.shared_secret:
-            return True
-        token = self.headers.get("X-Auth-Token", "") or self.headers.get("X-Auth", "")
+    def _mcp_read_route_allowed(self, path: str) -> bool:
+        if path not in MCP_READ_PATHS:
+            return False
+        parsed = urlparse(self.path)
+        if path == "/music/presence":
+            return not parsed.query
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if set(query) != {"id"}:
+            return False
+        song_ids = query.get("id", [])
+        if len(song_ids) != 1 or not is_valid_song_id(song_ids[0]):
+            return False
+        current = self.state.presence.read()
+        if current.get("freshness", {}).get("state") != "fresh":
+            return False
+        presence = current.get("presence")
+        song = presence.get("song") if isinstance(presence, dict) else None
+        return isinstance(song, dict) and hmac.compare_digest(
+            str(song.get("songId", "")), str(song_ids[0])
+        )
+
+    def _check_auth(self, path: str, method: str) -> str | None:
+        token = self.headers.get("X-Auth-Token", "")
         if not token:
-            qs = parse_qs(urlparse(self.path).query)
-            token = (qs.get("token") or [""])[0]
-        return token == self.state.shared_secret
+            return None
+        if hmac.compare_digest(token, self.state.full_auth_token):
+            return "full"
+        if (
+            hmac.compare_digest(token, self.state.mcp_read_token)
+            and method == "GET"
+            and self._mcp_read_route_allowed(path)
+        ):
+            return "mcp_read"
+        return None
 
-    def _require_auth(self) -> bool:
-        if self._check_auth():
+    def _require_auth(self, path: str, method: str) -> bool:
+        auth_role = self._check_auth(path, method)
+        if auth_role:
+            self.auth_role = auth_role
             return True
         self._send_json(403, {"error": "auth required"})
         return False
@@ -119,12 +394,29 @@ class EryuHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token, X-Auth")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", self.state.allowed_origin)
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token")
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_file(self, file_path: Path, content_type: str | None = None):
+    def _send_health_ok(self):
+        """Return the smallest useful health response without server metadata."""
+        data = b"ok"
+        self.send_response_only(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_file(
+        self,
+        file_path: Path,
+        content_type: str | None = None,
+        *,
+        cache_control: str | None = None,
+    ):
         """Serve a file with proper headers and Range support."""
         if not file_path.exists() or not file_path.is_file():
             self._send_json(404, {"error": "not found"})
@@ -147,8 +439,11 @@ class EryuHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
                 self.send_header("Content-Length", str(length))
                 self.send_header("Content-Type", content_type)
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Accept-Ranges", "bytes")
-                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Origin", self.state.allowed_origin)
+                if cache_control is not None:
+                    self.send_header("Cache-Control", cache_control)
                 self.end_headers()
                 with open(file_path, "rb") as f:
                     f.seek(start)
@@ -165,10 +460,13 @@ class EryuHandler(BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(size))
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token, X-Auth")
+        self.send_header("Access-Control-Allow-Origin", self.state.allowed_origin)
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token")
+        if cache_control is not None:
+            self.send_header("Cache-Control", cache_control)
         self.end_headers()
         with open(file_path, "rb") as f:
             while True:
@@ -179,22 +477,17 @@ class EryuHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", self.state.allowed_origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token, X-Auth, Range")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token, Range")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
     # ── Netease helpers ──
 
     def _netease_cookie(self) -> str:
-        cred = HERE / ".netease_cred"
-        try:
-            for line in cred.read_text().splitlines():
-                if line.startswith("MUSIC_U="):
-                    return f"MUSIC_U={line.split('=', 1)[1].strip()}"
-        except OSError:
-            pass
-        return ""
+        music_u = os.environ.get("MUSIC_U", "")
+        return f"MUSIC_U={music_u}" if music_u else ""
 
     def _netease_request(self, url: str, data: bytes | None = None,
                          extra_headers: dict[str, str] | None = None,
@@ -337,10 +630,10 @@ class EryuHandler(BaseHTTPRequestHandler):
 
         # Health check (no auth)
         if path == "/health":
-            self._send_json(200, {"ok": True, "version": "1.0", "service": "eryu"})
+            self._send_health_ok()
             return
 
-        # Static: cached music files (no auth — URLs are unguessable song IDs)
+        # Browser audio cannot attach the API header; expose numeric MP3s only.
         if path.startswith("/music/file/"):
             self._serve_music_file(path)
             return
@@ -352,7 +645,7 @@ class EryuHandler(BaseHTTPRequestHandler):
             return
 
         # All /music/* endpoints below require auth
-        if not self._require_auth():
+        if not self._require_auth(path, "GET"):
             return
 
         if path == "/music/search":
@@ -385,18 +678,28 @@ class EryuHandler(BaseHTTPRequestHandler):
             self._handle_music_similar()
         elif path == "/music/remote":
             self._handle_music_remote_get()
+        elif path == "/music/presence":
+            self._handle_music_presence_get()
         elif path == "/music/analyze/status":
             self._handle_analyze_status()
+        elif path == "/music/analyze/spectrogram":
+            self._handle_analyze_spectrogram()
         else:
             self._send_json(404, {"error": "not found"})
 
     # ── POST routes ───────────────────────────────────────────────────────────
 
     def do_POST(self):
-        if not self._require_auth():
-            return
         path = urlparse(self.path).path
-        body = self._read_body()
+        if not self._require_auth(path, "POST"):
+            return
+        try:
+            body = self._read_body()
+        except RequestBodyError as exc:
+            if exc.close_connection:
+                self.close_connection = True
+            self._send_json(exc.status, {"error": exc.message})
+            return
 
         if path == "/music/playlist/add":
             self._handle_music_playlist_add(body)
@@ -426,26 +729,30 @@ class EryuHandler(BaseHTTPRequestHandler):
             self._handle_music_profile_update(body)
         elif path == "/music/remote":
             self._handle_music_remote_post(body)
+        elif path == "/music/presence":
+            self._handle_music_presence_post(body)
         else:
             self._send_json(404, {"error": "not found"})
 
     # ── Static file serving ───────────────────────────────────────────────────
 
     def _serve_music_file(self, path: str):
-        """Serve cached mp3/png files from data/music_cache/."""
+        """Serve only cached numeric-song-id MP3 files required by the player."""
         filename = path[len("/music/file/"):]
-        if not filename or ".." in filename or "/" in filename:
-            self._send_json(400, {"error": "bad path"})
+        match = re.fullmatch(r"([0-9]{1,20})\.mp3", filename)
+        if match is None or not is_valid_song_id(match.group(1)):
+            self._send_json(404, {"error": "not found"})
             return
+        song_id = match.group(1)
         cache_dir = self.state.data_dir / "music_cache"
-        target = (cache_dir / filename).resolve()
+        target = (cache_dir / f"{song_id}.mp3").resolve()
         # Path traversal guard
         try:
             target.relative_to(cache_dir.resolve())
         except ValueError:
             self._send_json(403, {"error": "forbidden"})
             return
-        self._send_file(target)
+        self._send_file(target, "audio/mpeg", cache_control="no-store")
 
     def _serve_static(self, path: str):
         """Serve frontend static files from ../client/ directory."""
@@ -783,6 +1090,9 @@ class EryuHandler(BaseHTTPRequestHandler):
     def _handle_music_memory_get(self):
         qs = parse_qs(urlparse(self.path).query)
         song_id = qs.get("id", [""])[0]
+        if song_id and not is_valid_song_id(song_id):
+            self._send_json(400, {"error": "id must be a positive numeric id"})
+            return
         mem = self._load_song_memory()
         if song_id:
             entry = mem.get(str(song_id))
@@ -938,15 +1248,35 @@ class EryuHandler(BaseHTTPRequestHandler):
         self._save_song_memory(mem)
         self._send_json(200, {"ok": True, "counted": True})
 
+    # ── Read-only companion presence ──
+
+    def _handle_music_presence_get(self):
+        self._send_json(200, self.state.presence.read())
+
+    def _handle_music_presence_post(self, body: dict):
+        try:
+            response = self.state.presence.update(body)
+        except PresenceSequenceError:
+            self._send_json(
+                409,
+                {"ok": False, "error": "presence sequence must strictly increase"},
+            )
+            return
+        except PresenceValidationError:
+            self._send_json(400, {"ok": False, "error": "invalid presence payload"})
+            return
+        self._send_json(200, response)
+
     # ── Background pre-analysis ──
 
     def _handle_analyze_trigger(self, body: dict):
         song_id = body.get("songId")
         song_name = body.get("name", "")
         song_artist = body.get("artist", "")
-        if not song_id:
-            self._send_json(400, {"error": "missing songId"})
+        if not is_valid_song_id(song_id):
+            self._send_json(400, {"error": "songId must be a positive numeric id"})
             return
+        song_id = str(song_id)
         cache_dir = self.state.data_dir / "music_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         result_file = cache_dir / f"{song_id}_preanalysis.json"
@@ -970,23 +1300,37 @@ class EryuHandler(BaseHTTPRequestHandler):
         }))
         script = str(HERE / "analyze_song.py")
         subprocess.Popen(
-            ["python3", script, str(song_id), song_name, song_artist, str(cache_dir)],
+            [sys.executable, script, str(song_id), song_name, song_artist, str(cache_dir)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
+            env=_analyzer_environment(cache_dir),
         )
         self._send_json(200, {"ok": True, "status": "started"})
 
     def _handle_analyze_status(self):
         qs = parse_qs(urlparse(self.path).query)
-        song_id = qs.get("id", [""])[0]
-        if not song_id:
-            self._send_json(400, {"error": "missing id"})
+        song_ids = qs.get("id", [])
+        if len(song_ids) != 1 or not is_valid_song_id(song_ids[0]):
+            self._send_json(400, {"error": "id must be a positive numeric id"})
             return
+        song_id = str(song_ids[0])
         cache_dir = self.state.data_dir / "music_cache"
         result_file = cache_dir / f"{song_id}_preanalysis.json"
         if result_file.exists():
-            result = json.loads(result_file.read_text())
-            self._send_json(200, {"ok": True, "status": "ready", "analysis": result})
+            try:
+                result = json.loads(result_file.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(200, {"ok": True, "status": "error"})
+                return
+            analysis = _sanitize_analysis_result(
+                result,
+                song_id,
+                spectrogram_available=(cache_dir / f"{song_id}_analysis.png").is_file(),
+            )
+            if analysis is None:
+                self._send_json(200, {"ok": True, "status": "error"})
+                return
+            self._send_json(200, {"ok": True, "status": "ready", "analysis": analysis})
             return
         marker_file = cache_dir / f"{song_id}.analyzing"
         if marker_file.exists():
@@ -994,13 +1338,32 @@ class EryuHandler(BaseHTTPRequestHandler):
             if age < 60:
                 self._send_json(200, {"ok": True, "status": "running"})
                 return
-            marker_file.unlink(missing_ok=True)
         err_file = cache_dir / f"{song_id}_analyze_error.txt"
         if err_file.exists():
-            err = err_file.read_text()
-            self._send_json(200, {"ok": True, "status": f"error: {err}"})
+            self._send_json(200, {"ok": True, "status": "error"})
             return
         self._send_json(200, {"ok": True, "status": "none"})
+
+    def _handle_analyze_spectrogram(self):
+        qs = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        song_ids = qs.get("id", [])
+        if set(qs) != {"id"} or len(song_ids) != 1 or not is_valid_song_id(song_ids[0]):
+            self._send_json(400, {"error": "id must be a positive numeric id"})
+            return
+        song_id = str(song_ids[0])
+        image_file = self.state.data_dir / "music_cache" / f"{song_id}_analysis.png"
+        try:
+            size = image_file.stat().st_size
+        except OSError:
+            self._send_json(404, {"error": "spectrogram not found"})
+            return
+        if size <= 0:
+            self._send_json(404, {"error": "spectrogram not found"})
+            return
+        if size > MAX_SPECTROGRAM_BYTES:
+            self._send_json(413, {"error": "spectrogram too large"})
+            return
+        self._send_file(image_file, "image/png", cache_control="no-store")
 
     # ── Stats ──
 
@@ -1187,31 +1550,47 @@ class EryuHandler(BaseHTTPRequestHandler):
 # ── Server state ─────────────────────────────────────────────────────────────
 
 class ServerState:
-    def __init__(self, port: int):
-        self.host = "0.0.0.0"
+    def __init__(
+        self,
+        port: int,
+        *,
+        data_dir: Path | None = None,
+        presence_clock=None,
+        presence_utcnow=None,
+    ):
+        self.full_auth_token, self.mcp_read_token = _load_auth_tokens()
+        presence_ttl = parse_presence_ttl(os.environ.get("MUSIC_PRESENCE_TTL_SECONDS"))
+        self.host = _parse_server_host(os.environ.get("ERYU_HOST"))
+        self.allowed_origin = _parse_allowed_origin(os.environ.get("ERYU_ALLOWED_ORIGIN"))
         self.port = port
-        self.shared_secret = _load_or_create_secret()
-        self.data_dir = HERE / "data"
+        self.data_dir = (
+            Path(data_dir).resolve()
+            if data_dir is not None
+            else _parse_data_dir(os.environ.get("ERYU_DATA_DIR"))
+        )
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "music_cache").mkdir(parents=True, exist_ok=True)
+        presence_kwargs = {}
+        if presence_clock is not None:
+            presence_kwargs["monotonic"] = presence_clock
+        if presence_utcnow is not None:
+            presence_kwargs["utcnow"] = presence_utcnow
+        self.presence = PresenceStore(presence_ttl, **presence_kwargs)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    port = int(os.environ.get("PORT", "9090"))
+    port = _load_server_port()
     state = ServerState(port)
     EryuHandler.state = state
 
     server = ThreadingHTTPServer((state.host, state.port), EryuHandler)
     logger.info("eryu starting on %s:%d", state.host, state.port)
     logger.info("Data dir: %s", state.data_dir)
-    if state.shared_secret:
-        logger.info("Auth token: %s", state.shared_secret[:8] + "...")
-        logger.info("(Full token in %s)", HERE / ".secret")
-    else:
-        logger.warning("No shared secret — all requests allowed!")
-    logger.info("Netease cookie: %s", "configured" if (HERE / ".netease_cred").exists() else "NOT FOUND — create .netease_cred with MUSIC_U=<value>")
+    logger.info("Authentication: full and MCP read-only tokens configured")
+    logger.info("Music presence stale-after: %s seconds", state.presence.ttl_seconds)
+    logger.info("Netease cookie: %s", "configured" if os.environ.get("MUSIC_U") else "not configured")
     logger.info("Frontend: %s", "found" if (HERE.parent / "client").is_dir() else "not found (place files in ../client/)")
     try:
         server.serve_forever()
