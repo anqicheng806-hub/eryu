@@ -1,8 +1,8 @@
 # Auth0 与 ChatGPT 远程 MCP 配置清单
 
-状态：这是只读核准后的配置说明。尚未访问或修改 Auth0 租户，也尚未在
-ChatGPT 创建连接。不要在本文件、截图、聊天、命令参数或普通配置文件中
-填写任何秘密。
+状态：已只读访问 Auth0 的公开 OIDC discovery；尚未登录或修改 Auth0
+控制台，也尚未在 ChatGPT 创建连接。不要在本文件、截图、聊天、命令参数或
+普通配置文件中填写任何秘密。
 
 ## 固定地址
 
@@ -27,6 +27,14 @@ origin；ChatGPT 会把 metadata 中这个精确值作为 OAuth `resource` 参�
 - 打开 **Include Issuer in Authorization Responses**。
 - 打开 **Client ID Metadata Document Registration**。
 - 保持 **Dynamic Client Registration (DCR)** 关闭。
+
+2026-08-14 的公开 discovery 已确认 issuer、PKCE `S256` 和 token endpoint
+auth method `none`，但当前没有公布
+`client_id_metadata_document_supported: true`。因此 CIMD 尚不能标为 live-ready；
+在控制台人工开启对应设置后，必须重新读取 discovery，直到该字段明确为
+`true` 才进入 ChatGPT 连接阶段。discovery 当前也列出了
+`registration_endpoint`，但这不能代替控制台对 DCR 开关的核对；本项目仍要求
+DCR 保持关闭。
 
 还要只读检查租户是否仍有旧 Rules，以及 Actions 是否会改写 `scope`。
 若存在，不要先改；把名称和行为记录下来再单独评估。
@@ -101,16 +109,17 @@ Preview 和最终 Application 中核对它与 ChatGPT app management 页面逐�
 
 ## 5. Issuer 与运行时公开配置
 
-用户稍后只需提供公开 issuer URL。应以 Auth0
-`/.well-known/openid-configuration` 返回的 `issuer` 精确值为准，通常带
-尾斜杠，例如：
+2026-08-14 已只读请求 Auth0 `/.well-known/openid-configuration`，返回的
+`issuer` 精确值为（包含尾斜杠）：
 
 ```text
-https://YOUR_TENANT.us.auth0.com/
+https://dev-k1463twcjjecqewp.us.auth0.com/
 ```
 
-不要根据“美国区”猜租户名，也不要把自定义域 issuer 与
-`*.us.auth0.com` 的 issuer/JWKS 混用。运行时只需要：
+同一 discovery 文档返回同域的 `/authorize`、`/oauth/token` 和
+`/.well-known/jwks.json`，并公布 PKCE `S256` 与 token endpoint auth method
+`none`。部署预检仍要重新获取 discovery 并逐字符核对，不能仅依赖本地文档。
+不要把自定义域 issuer 与 `*.us.auth0.com` 的 issuer/JWKS 混用。运行时只需要：
 
 - 公开的 `AUTH0_ISSUER_URL`；
 - 公开且相同的 `MCP_PUBLIC_URL` 与 `AUTH0_AUDIENCE`；

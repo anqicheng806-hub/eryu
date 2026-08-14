@@ -24,7 +24,8 @@ Caddy 直接返回纯文本 `ok`，不转发后端，也不返回版本、路径
 - `systemd/eryu-mcp.service`：只读 MCP 服务，不接收完整控制 token 或 `MUSIC_U`。
 - `systemd/caddy-eryu-credentials.conf`：Caddy drop-in，只加载加密 Basic Auth
   条目，并把 Caddy 2.6.2 的配置 autosave 明确丢弃到 `/dev/null`。
-- `systemd/auth0-public.conf.example`：只保存公开的 Auth0 issuer URL 示例，不允许放 secret。
+- `systemd/auth0-public.conf.example`：保存已通过 OIDC discovery 验证的公开
+  Auth0 issuer URL，不允许放 secret。
 - `run-with-credentials.sh`：从 systemd 的临时凭据目录读取秘密并在进程内导出；不会打印值。
 - `create-caddy-basic-auth-credential.sh`：遮罩读取用户名/密码，生成 bcrypt
   hash 后直接加密成 systemd credential；不创建明文临时文件，也不输出值。
@@ -129,7 +130,7 @@ systemd 在 `/run/credentials/...` 提供的受限凭据副本和 Caddy 进程�
    `ERYU_AUTH_TOKEN` 必须与只读 token 不同。部署后只从密码管理器把它输入
    网页的密码框；网页不会把它保存到 `localStorage`，刷新页面后需要重新输入。
 
-4. 安装无秘密模板，并只在公开配置文件中填写用户稍后提供的 issuer URL。
+4. 安装无秘密模板。公开 issuer 已通过 OIDC discovery 验证并固定在模板中。
 
    ```bash
    # 在 VPS 的 SSH 终端运行；install 成功时无输出。
@@ -142,11 +143,12 @@ systemd 在 `/run/credentials/...` 提供的受限凭据副本和 Caddy 进程�
    sudo install -o root -g root -m 0644 /opt/eryu/current/deploy/systemd/caddy-eryu-credentials.conf /etc/systemd/system/caddy.service.d/eryu-credentials.conf
    sudo install -d -o root -g root -m 0755 /etc/eryu
    sudo install -o root -g root -m 0644 /opt/eryu/current/deploy/systemd/auth0-public.conf.example /etc/eryu/auth0-public.conf
-   sudoedit /etc/eryu/auth0-public.conf
+   sudo grep -Fxq 'AUTH0_ISSUER_URL=https://dev-k1463twcjjecqewp.us.auth0.com/' /etc/eryu/auth0-public.conf
    sudo systemd-analyze verify /etc/systemd/system/eryu-web.service /etc/systemd/system/eryu-mcp.service caddy.service
    ```
 
-   `sudoedit` 后应只出现一项公开值：`AUTH0_ISSUER_URL=https://.../`。不要加入 token、`MUSIC_U` 或 client secret。
+   `grep -Fxq` 成功时没有输出；非 0 就停止。该公开文件只能包含已验证的
+   `AUTH0_ISSUER_URL`，不要加入 token、`MUSIC_U` 或 client secret。
 
 5. 在尚未加入 Eryu 路由时，先让现有 Caddy 采用“不保存 autosave”的边界。
    Caddy 2.6.2 在进程启动时固定 autosave 路径，`daemon-reload` 后只做 reload
@@ -213,6 +215,11 @@ systemd 在 `/run/credentials/...` 提供的受限凭据副本和 Caddy 进程�
 7. 只有在服务、Caddy 和 Auth0 配置再次确认后，才启动两个 Eryu 服务、验证
    loopback，最后 reload Caddy。这里的 reload 也需要再次批准；它不会重启
    Shared Diary，但前提是步骤 5 的受控 restart 已经成功完成。
+
+   当前 Auth0 discovery 已验证 issuer、PKCE `S256` 和 token endpoint auth
+   method `none`，但尚未公布 `client_id_metadata_document_supported: true`。
+   必须先由用户在 Auth0 控制台完成 `docs/auth0-chatgpt.md` 的人工设置并重新
+   只读核对 discovery；字段未明确变为 `true` 时不得启动远程 MCP 验收。
 
    ```bash
    # 这些是最后写入阶段的命令，目前禁止执行。

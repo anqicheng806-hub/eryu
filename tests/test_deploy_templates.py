@@ -52,7 +52,10 @@ class DeploymentTemplateTest(unittest.TestCase):
         ]
         self.assertEqual(
             assignments,
-            ["AUTH0_ISSUER_URL=https://YOUR_AUTH0_TENANT.us.auth0.com/"],
+            [
+                "AUTH0_ISSUER_URL="
+                "https://dev-k1463twcjjecqewp.us.auth0.com/"
+            ],
         )
         self.assertNotRegex(config, r"(?im)^(?:.*TOKEN|MUSIC_U|CLIENT_SECRET)=")
 
