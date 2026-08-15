@@ -326,31 +326,39 @@ data, but all four MCP tools fail closed and do not describe it as current.
 - Auth0 issuer, audience, and JWKS are public metadata. No Auth0 client secret
   or Management API token is used by this resource server.
 
-## VPS deployment gate (local templates ready; not executed)
+## VPS deployment gate (candidate staged; live cutover not executed)
 
-Historical VPS evidence has been reviewed, but the currently installed Caddy
-source, binary, modules, systemd command line, and live Shared Diary Caddyfile
-have not been re-inspected in this no-VPS phase. No upload, install, service
-restart, proxy change, certificate request, secret creation, Auth0 write, or
-deployment has been performed. The approved design uses separate web/MCP
-sslip.io hosts, loopback ports `9090`/`9091`, Caddy, two systemd services, and
-encrypted systemd credentials. Every VPS write still needs separate approval.
+An approved read-only inspection and isolated candidate-staging phase confirmed
+the live service still uses `/usr/bin/caddy` v2.6.2 and did not change its
+systemd unit, Caddyfile, process, or listeners. The signed Caddy v2.11.4
+candidate is installed only at `/opt/caddy-candidates/v2.11.4/caddy`; its ELF
+SHA-256 is
+`b7105518e3ed1c0761f232e44fc09345535533c9cb0abf0e12809416c7ac64d9`.
+The candidate validated both the current Shared Diary configuration and the
+planned Shared Diary + Eryu configuration in isolation, with no `forward_auth`.
+No live binary switch, service restart/reload, Eryu deployment, secret creation,
+or Auth0 write has been performed. Every further VPS write still needs its
+separate approval gate.
 
-The historically observed Caddy 2.6.2 is blocked from hosting Eryu. Caddy must
-first pass the separate source/module/systemd inventory, exact-version upgrade,
-Shared Diary regression, and rollback gates in
+The live Caddy 2.6.2 is blocked from hosting Eryu. The fixed v2.11.4 exception
+candidate must still pass the cutover-time digest/unit checks, live Shared Diary
+regression, and rollback gates in
 [`deploy/CADDY-UPGRADE.md`](../deploy/CADDY-UPGRADE.md). The post-upgrade Eryu
 fragment uses `basic_auth`; the shared root Caddyfile must natively set
 `persist_config off` and move the Admin API to a permissioned `0600` Unix
-socket before the encrypted account credential is loaded. The old
+socket before the encrypted account credential is loaded. All candidate
+version/validate/run/reload commands use the versioned `/opt` path; the old
+`/usr/bin/caddy` remains untouched solely as the v2.6.2 rollback entry. The old
 XDG/autosave symlink workaround and default localhost Admin API are no longer
-part of the deployment. No Caddy upgrade, restart, or reload has been executed.
+part of the deployment. No live Caddy binary switch, restart, or reload has been
+executed.
 
 After approval, deployment should proceed in these separately verified stages:
 
-1. Read-only inventory the actual Caddy package source, exact binary and hash,
-   modules, systemd commands/drop-ins, and file-backed Shared Diary routes.
-2. Upgrade Caddy in its own approved maintenance window and complete the Shared
+1. Recheck the already recorded binary/unit/config manifests immediately before
+   the approved maintenance transaction; any drift stops the cutover.
+2. Switch Caddy to the fixed versioned candidate in its own approved maintenance
+   window and complete the Shared
    Diary regression; do not add Eryu during that window.
 3. Present the exact Eryu target paths and commands for confirmation; do not
    transmit or print any secret during this step.
@@ -362,8 +370,10 @@ After approval, deployment should proceed in these separately verified stages:
 6. Start the backend/MCP topology only after separate approval, then verify
    health, auth denial, fresh/stale presence, OAuth discovery, and all four
    read-only tools before a separately approved Caddy reload.
-7. Keep both the pre-upgrade Caddy artifacts and previous application release
-   intact until verification succeeds; no rollback or restart is automatic.
+7. Keep the old Caddyfile/imports, unit/drop-ins, untouched `/usr/bin/caddy`, and
+   previous application release intact. A future approval may pre-authorize one
+   conditional rollback only for Caddy remaining inactive or three consecutive
+   complete Shared Diary baseline failures; unknown states never trigger it.
 
 The final target is a ChatGPT-connectable HTTPS Streamable HTTP MCP, not merely
 local stdio. `stdio` remains only as a local regression/debug mode. See

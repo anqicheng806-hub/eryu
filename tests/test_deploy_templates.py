@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -11,6 +12,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / "deploy"
 ANALYSIS_REQUIREMENTS = ROOT / "server" / "requirements-analysis.txt"
+CADDY_CANDIDATE = "/opt/caddy-candidates/v2.11.4/caddy"
+CADDY_CANDIDATE_SHA256 = (
+    "b7105518e3ed1c0761f232e44fc09345535533c9cb0abf0e12809416c7ac64d9"
+)
+CADDY_ASSET_SHA256 = (
+    "527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9"
+)
+ERYU_CADDY_SHA256 = (
+    "23c29b8ec7b777f8858281e832ca257ff9200f2cb3d51e5640024a7eb1b3fed3"
+)
 
 
 class DeploymentTemplateTest(unittest.TestCase):
@@ -127,6 +138,43 @@ class DeploymentTemplateTest(unittest.TestCase):
         self.assertNotRegex(drop_in, r"\$2[aby]\$")
         self.assertNotRegex(drop_in, r"(?i)password\s*=")
 
+        candidate_drop_in = self.read("systemd/caddy-v2114-candidate.conf")
+        candidate_directives = [
+            line
+            for line in candidate_drop_in.splitlines()
+            if line and not line.startswith("[") and not line.startswith("#")
+        ]
+        self.assertEqual(
+            candidate_directives,
+            [
+                "ExecStart=",
+                f"ExecStart={CADDY_CANDIDATE} run --config /etc/caddy/Caddyfile "
+                "--adapter caddyfile",
+                "ExecReload=",
+                f"ExecReload={CADDY_CANDIDATE} reload --config /etc/caddy/Caddyfile "
+                "--adapter caddyfile --force --address unix//run/caddy/admin.sock",
+                "RuntimeDirectory=caddy",
+                "RuntimeDirectoryMode=0750",
+                "RuntimeDirectoryPreserve=no",
+            ],
+        )
+        self.assertIn(
+            f"ExecStart={CADDY_CANDIDATE} run --config /etc/caddy/Caddyfile "
+            "--adapter caddyfile",
+            candidate_drop_in,
+        )
+        self.assertIn(
+            f"ExecReload={CADDY_CANDIDATE} reload --config /etc/caddy/Caddyfile "
+            "--adapter caddyfile --force --address unix//run/caddy/admin.sock",
+            candidate_drop_in,
+        )
+        self.assertIn("RuntimeDirectory=caddy", candidate_drop_in)
+        self.assertIn("RuntimeDirectoryMode=0750", candidate_drop_in)
+        self.assertIn("RuntimeDirectoryPreserve=no", candidate_drop_in)
+        self.assertNotIn("/usr/bin/caddy", candidate_drop_in)
+        self.assertNotIn("ExecStartPre", candidate_drop_in)
+        self.assertNotIn("ExecCondition", candidate_drop_in)
+
         plan = self.read("README.md")
         upgrade_plan = self.read("CADDY-UPGRADE.md")
         self.assertIn("Caddy 2.6.2 不允许直接承载 Eryu", upgrade_plan)
@@ -136,7 +184,10 @@ class DeploymentTemplateTest(unittest.TestCase):
         self.assertIn("basic_auth", upgrade_plan)
         self.assertIn("GHSA-6365-7ppr-5r92", upgrade_plan)
         self.assertIn("v2.11.5", upgrade_plan)
-        self.assertIn("list-modules --packages --versions", upgrade_plan)
+        self.assertIn(
+            f"{CADDY_CANDIDATE} list-modules --skip-standard --packages --versions",
+            upgrade_plan,
+        )
         self.assertIn('test "$systemd_major" -ge 254', upgrade_plan)
         self.assertIn("Admin-API-only", upgrade_plan)
         self.assertIn("--environ", upgrade_plan)
@@ -215,7 +266,8 @@ class DeploymentTemplateTest(unittest.TestCase):
         self.assertIn("caddy_existing_drop_ins=absent", upgrade_plan)
         self.assertIn("caddy_existing_runtime_directory=absent", upgrade_plan)
         self.assertIn("caddy_unit_fragment=approved sha256=", upgrade_plan)
-        self.assertIn("精确版本的 `.deb` 解包", upgrade_plan)
+        self.assertIn("官方 Release archive", upgrade_plan)
+        self.assertIn("dpkg metadata 只盘点旧", upgrade_plan)
         self.assertIn("RuntimeDirectory=caddy", upgrade_plan)
         self.assertIn("RuntimeDirectoryMode=0750", upgrade_plan)
         self.assertIn("RuntimeDirectoryPreserve=no", upgrade_plan)
@@ -223,10 +275,34 @@ class DeploymentTemplateTest(unittest.TestCase):
         self.assertIn("Caddy 二进制 mode `0750`", upgrade_plan)
         self.assertIn("root-only\n   manifest", upgrade_plan)
         self.assertIn("NeedDaemonReload=no", upgrade_plan)
+        self.assertIn(CADDY_CANDIDATE, plan)
+        self.assertIn(CADDY_CANDIDATE, upgrade_plan)
+        self.assertIn(CADDY_CANDIDATE_SHA256, plan)
+        self.assertIn(CADDY_CANDIDATE_SHA256, upgrade_plan)
+        self.assertIn(CADDY_ASSET_SHA256, upgrade_plan)
+        self.assertIn(
+            "https://github.com/caddyserver/caddy/.github/workflows/release.yml@"
+            "refs/tags/v2.11.4",
+            upgrade_plan,
+        )
+        self.assertIn("https://token.actions.githubusercontent.com", upgrade_plan)
 
         helper = self.read("create-caddy-basic-auth-credential.sh")
         self.assertIn("/usr/bin/systemd-ask-password", helper)
-        self.assertIn("/usr/bin/caddy hash-password --algorithm bcrypt", helper)
+        self.assertIn('"$CADDY_CANDIDATE" hash-password --algorithm bcrypt', helper)
+        self.assertIn(CADDY_CANDIDATE, helper)
+        self.assertIn(CADDY_CANDIDATE_SHA256, helper)
+        self.assertIn("/usr/bin/sha256sum", helper)
+        self.assertIn("/usr/sbin/getcap", helper)
+        self.assertIn('[[ -f "$CADDY_CANDIDATE" && ! -L "$CADDY_CANDIDATE" ]]', helper)
+        self.assertLess(
+            helper.index("caddy_candidate_sha256="),
+            helper.index("Eryu Basic Auth username"),
+        )
+        self.assertLess(
+            helper.index("caddy_candidate_capabilities="),
+            helper.index("Eryu Basic Auth username"),
+        )
         self.assertIn('/usr/bin/systemd-creds encrypt --name="$CREDENTIAL_NAME"', helper)
         self.assertNotIn("--plaintext", helper)
         self.assertNotIn("set -x", helper)
@@ -321,7 +397,7 @@ class DeploymentTemplateTest(unittest.TestCase):
             plan,
         )
         self.assertIn(
-            "/usr/bin/caddy validate --config /etc/caddy/Caddyfile "
+            '"$CADDY_CANDIDATE" validate --config /etc/caddy/Caddyfile '
             "--adapter caddyfile || caddy_activation_failed",
             plan,
         )
@@ -367,6 +443,11 @@ class DeploymentTemplateTest(unittest.TestCase):
             plan,
         )
         self.assertIn("eryu_public_cutover=failed", plan)
+        self.assertIn("--property=PrivateNetwork=yes", plan)
+        self.assertIn("--property=ProtectSystem=strict", plan)
+        self.assertIn("--property=StandardOutput=null", plan)
+        self.assertIn("--property=StandardError=null", plan)
+        self.assertNotIn("systemd-run --quiet --wait --pipe --collect", plan)
         web_health = plan.index(
             "/usr/bin/curl --fail --silent --show-error "
             "http://127.0.0.1:9090/health"
@@ -406,7 +487,7 @@ class DeploymentTemplateTest(unittest.TestCase):
     def test_caddy_candidate_is_validated_before_atomic_live_replacement(self) -> None:
         plan = self.read("README.md")
         validate_candidate = plan.index(
-            "/usr/bin/caddy validate --config "
+            f"{CADDY_CANDIDATE} validate --config "
             "/etc/caddy/.Caddyfile.eryu-candidate"
         )
         copy_candidate = plan.index(
@@ -420,9 +501,24 @@ class DeploymentTemplateTest(unittest.TestCase):
         )
         self.assertLess(copy_candidate, validate_candidate)
         self.assertLess(validate_candidate, atomic_replace)
+        approved_root_check = plan.index(
+            "/var/backups/caddy-v2114-cutover/Caddyfile.post-v2114-approved "
+            "/etc/caddy/Caddyfile || caddy_route_install_failed"
+        )
+        approved_root_copy = plan.index(
+            "/var/backups/caddy-v2114-cutover/Caddyfile.post-v2114-approved "
+            "/var/backups/eryu-deploy/Caddyfile.pre-eryu"
+        )
+        self.assertLess(approved_root_check, approved_root_copy)
+        self.assertLess(approved_root_copy, copy_candidate)
+        self.assertNotIn(
+            "/usr/bin/cp --preserve=mode,ownership,timestamps "
+            "/etc/caddy/Caddyfile /var/backups/eryu-deploy/Caddyfile.pre-eryu",
+            plan,
+        )
         self.assertIn("eryu_caddy_route_install=failed", plan)
         self.assertIn(
-            "/usr/bin/caddy validate --config "
+            f"{CADDY_CANDIDATE} validate --config "
             "/etc/caddy/.Caddyfile.eryu-candidate --adapter caddyfile "
             "|| caddy_route_install_failed",
             plan,
@@ -452,6 +548,9 @@ class DeploymentTemplateTest(unittest.TestCase):
 
     def test_caddy_route_rollback_is_validated_before_atomic_replacement(self) -> None:
         plan = self.read("README.md")
+        rollback_section = plan.split("caddy_route_rollback_failed() {", 1)[1].split(
+            "```", 1
+        )[0]
         rollback_validate = plan.index("--unit=eryu-caddy-rollback-validate")
         rollback_replace = plan.index(
             "/usr/bin/sudo /usr/bin/mv -T /etc/caddy/.Caddyfile.eryu-rollback "
@@ -464,7 +563,7 @@ class DeploymentTemplateTest(unittest.TestCase):
         self.assertLess(rollback_replace, rollback_delete_fragment)
         self.assertIn("eryu_caddy_route_rollback=failed", plan)
         self.assertIn(
-            "/usr/bin/caddy validate --config "
+            f"{CADDY_CANDIDATE} validate --config "
             "/etc/caddy/.Caddyfile.eryu-rollback --adapter caddyfile "
             "|| caddy_route_rollback_failed",
             plan,
@@ -476,6 +575,26 @@ class DeploymentTemplateTest(unittest.TestCase):
         )
         self.assertLess(rollback_validate, rollback_live_approved)
         self.assertLess(rollback_live_approved, rollback_replace)
+        approved_root_binding = (
+            "/var/backups/caddy-v2114-cutover/Caddyfile.post-v2114-approved "
+            "/var/backups/eryu-deploy/Caddyfile.pre-eryu"
+        )
+        self.assertEqual(rollback_section.count(approved_root_binding), 2)
+        self.assertLess(
+            rollback_section.index(approved_root_binding),
+            rollback_section.index(
+                "/usr/bin/cp --preserve=mode,ownership,timestamps "
+                "/var/backups/eryu-deploy/Caddyfile.pre-eryu"
+            ),
+        )
+        self.assertLess(
+            rollback_section.rindex(approved_root_binding),
+            rollback_section.index(
+                "/usr/bin/mv -T /etc/caddy/.Caddyfile.eryu-rollback"
+            ),
+        )
+        self.assertIn("root:root:700", rollback_section)
+        self.assertIn("root:root:644:1", rollback_section)
         self.assertIn(
             "/usr/bin/sudo /usr/bin/test ! -L "
             "/etc/caddy/.Caddyfile.eryu-rollback",
@@ -488,6 +607,115 @@ class DeploymentTemplateTest(unittest.TestCase):
                 "= root:root"
             ),
             2,
+        )
+
+    def test_caddy_candidate_and_conditional_rollback_contract_are_pinned(self) -> None:
+        plan = self.read("README.md")
+        upgrade_plan = self.read("CADDY-UPGRADE.md")
+        helper = self.read("create-caddy-basic-auth-credential.sh")
+        candidate_drop_in = self.read("systemd/caddy-v2114-candidate.conf")
+
+        for document in (plan, upgrade_plan, helper, candidate_drop_in):
+            self.assertIn(CADDY_CANDIDATE, document)
+        for document in (plan, upgrade_plan, helper):
+            self.assertIn(CADDY_CANDIDATE_SHA256, document)
+        for document in (plan, upgrade_plan):
+            self.assertNotIn("/usr/bin/caddy version", document)
+            self.assertNotIn("/usr/bin/caddy build-info", document)
+            self.assertNotIn("/usr/bin/caddy list-modules", document)
+        self.assertEqual(
+            hashlib.sha256((DEPLOY / "caddy/eryu.caddy").read_bytes()).hexdigest(),
+            ERYU_CADDY_SHA256,
+        )
+
+        activation_section = plan.split("caddy_activation_failed() {", 1)[1].split(
+            "```", 1
+        )[0]
+        route_install_section = plan.split("caddy_route_install_failed() {", 1)[1].split(
+            "```", 1
+        )[0]
+        route_rollback_section = plan.split("caddy_route_rollback_failed() {", 1)[1].split(
+            "```", 1
+        )[0]
+        self.assertNotIn("/usr/bin/caddy", activation_section)
+        self.assertNotIn("/usr/bin/caddy", route_install_section)
+        self.assertNotIn("/usr/bin/caddy", route_rollback_section)
+
+        rollback_contract = upgrade_plan.split(
+            "## 8. 一次性条件式回滚合同", 1
+        )[1]
+        self.assertIn("caddy_inactive", rollback_contract)
+        self.assertIn("shared_diary_baseline_failed_3x", rollback_contract)
+        self.assertIn("连续三轮", rollback_contract)
+        self.assertIn("任一轮通过就清零并取消回滚", rollback_contract)
+        self.assertIn("重新指向 `/usr/bin/caddy`", rollback_contract)
+        self.assertIn("最多一次", rollback_contract)
+        self.assertIn("unknown", rollback_contract)
+        self.assertIn("不得覆盖", upgrade_plan)
+        self.assertIn("## 9. 下次维护审批前必须实例化的现场锚点", upgrade_plan)
+        self.assertIn("manifest/snapshot 本身等于", upgrade_plan)
+        self.assertIn("type/owner/group/mode/nlink 批准记录", upgrade_plan)
+        self.assertIn("第 9 节的两个现场锚点", plan)
+        self.assertEqual(
+            re.findall(r"`trigger=([a-z0-9_]+)`", rollback_contract),
+            ["caddy_inactive", "shared_diary_baseline_failed_3x"],
+        )
+
+        public_section = plan.split("eryu_public_cutover_failed() {", 1)[1].split(
+            "```", 1
+        )[0]
+        public_reload = public_section.index(
+            "/usr/bin/systemctl reload caddy.service"
+        )
+        self.assertLess(public_section.index(CADDY_CANDIDATE_SHA256), public_reload)
+        self.assertLess(public_section.index("caddy_public_reload_property"), public_reload)
+        self.assertLess(
+            public_section.rindex("sha256sum --check --status"), public_reload
+        )
+        self.assertLess(
+            public_section.rindex("Caddyfile.expected-eryu"), public_reload
+        )
+        self.assertIn("caddy-v2114-candidate.conf", public_section)
+        self.assertIn("eryu-credentials.conf", public_section)
+        self.assertIn("systemd-files-post-eryu.sha256", public_section)
+        self.assertIn("caddy_public_expect_bus_property Environment 'as 0'", public_section)
+        self.assertIn(
+            "caddy_public_expect_bus_property LoadCredentialEncrypted 'a(ss) 1",
+            public_section,
+        )
+        self.assertIn("ExecStart ExecStartEx ExecReload ExecReloadEx", public_section)
+        self.assertIn("/usr/sbin/getcap", public_section)
+        self.assertIn('/proc/$caddy_public_main_pid/exe', public_section)
+        self.assertLess(public_section.index("systemd-files-post-eryu.sha256"), public_reload)
+        self.assertLess(public_section.index("caddy_public_expect_bus_property"), public_reload)
+        self.assertLess(public_section.rindex("forward_auth"), public_reload)
+
+        self.assertLess(
+            route_rollback_section.index("caddy_rollback_reload_property"),
+            route_rollback_section.index("/usr/bin/systemctl reload caddy.service"),
+        )
+        self.assertLess(
+            route_rollback_section.index("sha256sum --check --status"),
+            route_rollback_section.index("/usr/bin/systemctl reload caddy.service"),
+        )
+        self.assertIn("caddy-v2114-candidate.conf", route_rollback_section)
+        self.assertIn("eryu-credentials.conf", route_rollback_section)
+        self.assertIn("set +x\ncaddy_route_rollback_failed", plan)
+        self.assertIn("DBUS_SYSTEM_BUS_ADDRESS", route_rollback_section)
+        self.assertIn("caddy_rollback_expect_bus_property Environment 'as 0'", route_rollback_section)
+        self.assertIn(
+            "caddy_rollback_expect_bus_property LoadCredentialEncrypted 'a(ss) 1",
+            route_rollback_section,
+        )
+        self.assertIn("ExecStart ExecStartEx ExecReload ExecReloadEx", route_rollback_section)
+        self.assertIn("/usr/sbin/getcap", route_rollback_section)
+        self.assertIn('/proc/$caddy_route_rollback_main_pid/exe', route_rollback_section)
+        self.assertLess(route_rollback_section.rindex("forward_auth"), route_rollback_section.index("/usr/bin/systemctl reload caddy.service"))
+        self.assertIn('/proc/$caddy_main_pid/exe', activation_section)
+        self.assertIn("/usr/sbin/getcap", activation_section)
+        self.assertIn(ERYU_CADDY_SHA256, plan)
+        self.assertNotRegex(
+            self.read("caddy/eryu.caddy"), r"(?m)^\s*forward_auth\b"
         )
 
     def test_bash_pipeline_status_is_snapshotted_before_indexing(self) -> None:

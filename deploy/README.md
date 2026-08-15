@@ -16,9 +16,13 @@ Python 服务不直接监听公网，VPS 防火墙也不需要开放 9090/9091�
 `/health` 外，静态页面、全部 API、JS/CSS 和所有音频缓存路径都先经过 Caddy
 Basic Auth；API 在通过 Basic Auth 后仍需原有完整 token。公开 `/health` 由
 Caddy 直接返回纯文本 `ok`，不转发后端，也不返回版本、路径或运行状态。
-历史检查中的 Caddy 2.6.2 不允许直接承载本项目。升级后的 Eryu 片段使用
-`basic_auth`；实际目标版本、二进制 SHA、模块与 Shared Diary 兼容性必须在
-升级当天重新核验。
+历史检查中的 Caddy 2.6.2 不允许直接承载本项目。经签名、checksum、版本、模块
+和隔离 validation 核验的例外候选固定为
+`/opt/caddy-candidates/v2.11.4/caddy`，其 ELF SHA-256 固定为
+`b7105518e3ed1c0761f232e44fc09345535533c9cb0abf0e12809416c7ac64d9`。
+升级后的 Eryu 片段使用 `basic_auth`；切换当天仍须重新计算同一路径的摘要并核对
+Shared Diary 基线。`/usr/bin/caddy` 不得被覆盖，只保留为旧 v2.6.2 的完整回滚
+入口。
 
 默认部署会创建全新的 `/var/lib/eryu`。本地 `server/data`、音乐缓存、cookie、token 和日志都不会上传；如果以后需要迁移本地音乐数据，必须作为单独阶段再次确认。
 
@@ -28,6 +32,8 @@ Caddy 直接返回纯文本 `ok`，不转发后端，也不返回版本、路径
 - `systemd/eryu-mcp.service`：只读 MCP 服务，不接收完整控制 token 或 `MUSIC_U`。
 - `systemd/caddy-eryu-credentials.conf`：升级后 Caddy 的最小 drop-in，只加载
   加密 Basic Auth 条目；不再包含 2.6.2 专用 autosave workaround。
+- `systemd/caddy-v2114-candidate.conf`：固定候选的 `ExecStart`、`ExecReload` 与
+  `/run/caddy` 合同；所有新版本运行命令只使用版本化绝对路径。
 - `systemd/auth0-public.conf.example`：保存已通过 OIDC discovery 验证的公开
   Auth0 issuer URL，不允许放 secret。
 - `run-with-credentials.sh`：从 systemd 的临时凭据目录读取秘密并在进程内导出；不会打印值。
@@ -64,7 +70,11 @@ Shared Diary 回归和回滚细节见
 
 ## 待确认后才执行的命令顺序
 
-以下命令只是部署方案，目前没有运行。每一步都应先检查上一条结果，再继续下一条。
+以下 Eryu 部署与线上切换命令只是方案，目前没有运行。已完成的候选 staging 证据
+不能替代维护窗口重检；每一步都应先检查上一条结果，再继续下一条。
+在申请该维护窗口前，还必须把 `CADDY-UPGRADE.md` 第 9 节的两个现场锚点
+实例化为本次 transaction 的固定 SHA/元数据记录；未完成时，下面的写入、
+restart 与 reload 代码块均不得执行。
 
 0. 先完成 Caddy 的独立只读盘点、安全升级和 Shared Diary 回归。任何输出与
    预期不一致都必须停止，不能继续部署 Eryu。
@@ -75,6 +85,7 @@ Shared Diary 回归和回滚细节见
      printf '%s\n' 'eryu_readonly_gate=failed' >&2
      exit 1
    }
+   # /usr/bin/caddy 仅盘点为旧 v2.6.2 回滚基线；不得覆盖或当作新候选。
    test "$(command -v caddy)" = /usr/bin/caddy || readonly_gate_failed
    test "$(command -v git)" = /usr/bin/git || readonly_gate_failed
    test "$(command -v awk)" = /usr/bin/awk || readonly_gate_failed
@@ -118,9 +129,7 @@ Shared Diary 回归和回滚细节见
    [[ "$systemd_version_record" =~ ^systemd[[:space:]]+([0-9]+) ]] || readonly_gate_failed
    systemd_major=${BASH_REMATCH[1]}
    test "$systemd_major" -ge 254 || readonly_gate_failed
-   /usr/bin/caddy version || readonly_gate_failed
-   /usr/bin/caddy build-info || readonly_gate_failed
-   /usr/bin/caddy list-modules --packages --versions || readonly_gate_failed
+   # 不执行旧入口做版本探测；所有候选版本/模块检查均使用固定 /opt 路径。
    /usr/bin/dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' caddy || readonly_gate_failed
    /usr/bin/apt-cache policy caddy || readonly_gate_failed
    caddy_unit_user="$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=User --value 2> /dev/null)" || readonly_gate_failed
@@ -136,12 +145,14 @@ Shared Diary 回归和回滚细节见
    unset -f readonly_gate_failed
    ```
 
-   安装来源、模块、真实 ExecStart 和线上 Shared Diary 配置本轮均未现场核验。
+   安装来源、模块、真实 ExecStart 和线上 Shared Diary 配置此前已做过只读分类，
+   但这些证据会漂移，维护窗口必须按本节和升级计划重新核验。
    上述四项 `trusted_binary` 指纹也必须先进入维护审批记录，后续写入前重新计算
    并逐字符匹配；任一变化都停止。
    unit fragment、drop-ins、父目录、RuntimeDirectory 与 SHA 的完整固定分类必须
    按 `CADDY-UPGRADE.md` 同步通过；这里的简表不能替代它。整包
-   `dpkg --verify caddy` 也不能替代从精确签名 `.deb` 解包后的二进制 SHA 对比。
+   `dpkg --verify caddy` 也不能替代新候选的 Sigstore/Rekor、已签 Release archive
+   checksum 与解包后 ELF SHA 对比。
    完整命令、候选版本条件、官方安全公告、维护窗口和回滚顺序都在
    [`CADDY-UPGRADE.md`](CADDY-UPGRADE.md)。升级必须先单独完成；不得把 Caddy
    upgrade、Eryu 路由和 Eryu 服务启动合并成一次变更。
@@ -308,7 +319,8 @@ Shared Diary 回归和回滚细节见
    批准的维护门**中 restart Caddy 一次，使第 4 步新增的 encrypted credential
    真正进入这次 service activation。此时仍未加入 Eryu route；restart 后必须
    再完成 Shared Diary 回归并停下报告。只做 reload 不能替代这次 activation。
-   目标值来自 `CADDY-UPGRADE.md` 的现场定案，不能在这里猜。
+   候选路径和 SHA 已固定；仍须逐字节复核，不能改用 `PATH`、symlink 或
+   `/usr/bin/caddy`。
    代码块开头要求输入的两条 approved record 必须来自第 4 节 root-only manifest
    与维护审批记录，不能从本次 `daemon-reload` 后的 live 输出反填。其中
    `LoadCredentialEncrypted` 记录只能包含这一条 Eryu Basic Auth credential；
@@ -325,6 +337,13 @@ Shared Diary 回归和回滚细节见
      printf '%s\n' 'caddy_credential_activation=failed' >&2
      exit 1
    }
+   for caddy_activation_tool in \
+     /usr/bin/busctl /usr/bin/grep /usr/bin/readlink /usr/bin/sha256sum /usr/bin/ss \
+     /usr/bin/stat /usr/bin/sudo /usr/bin/systemctl /usr/bin/systemd \
+     /usr/bin/systemd-analyze /usr/bin/systemd-run /usr/sbin/getcap; do
+     test -x "$caddy_activation_tool" || caddy_activation_failed
+   done
+   unset caddy_activation_tool
    test -z "${DBUS_SYSTEM_BUS_ADDRESS+x}" || caddy_activation_failed
    read -r -p 'Approved exact post-Eryu DropInPaths record: ' caddy_approved_drop_in_paths || caddy_activation_failed
    test -n "$caddy_approved_drop_in_paths" || caddy_activation_failed
@@ -332,10 +351,40 @@ Shared Diary 回归和回滚细节见
      *" /etc/systemd/system/caddy.service.d/eryu-credentials.conf "*) ;;
      *) caddy_activation_failed ;;
    esac
-   test "$(command -v caddy)" = /usr/bin/caddy || caddy_activation_failed
-   test "$(command -v busctl)" = /usr/bin/busctl || caddy_activation_failed
-   test -x /usr/bin/caddy || caddy_activation_failed
-   test -x /usr/bin/busctl || caddy_activation_failed
+   case " $caddy_approved_drop_in_paths " in
+     *" /etc/systemd/system/caddy.service.d/caddy-v2114-candidate.conf "*) ;;
+     *) caddy_activation_failed ;;
+   esac
+   readonly CADDY_CANDIDATE=/opt/caddy-candidates/v2.11.4/caddy
+   readonly CADDY_CANDIDATE_SHA256=b7105518e3ed1c0761f232e44fc09345535533c9cb0abf0e12809416c7ac64d9
+   for caddy_candidate_directory in /opt /opt/caddy-candidates /opt/caddy-candidates/v2.11.4; do
+     test -d "$caddy_candidate_directory" || caddy_activation_failed
+     test ! -L "$caddy_candidate_directory" || caddy_activation_failed
+     test "$(/usr/bin/stat -c '%U:%G:%a' "$caddy_candidate_directory")" = root:root:755 || caddy_activation_failed
+   done
+   unset caddy_candidate_directory
+   test -f "$CADDY_CANDIDATE" || caddy_activation_failed
+   test ! -L "$CADDY_CANDIDATE" || caddy_activation_failed
+   test -x "$CADDY_CANDIDATE" || caddy_activation_failed
+   test "$(/usr/bin/stat -c '%U:%G:%a:%h' "$CADDY_CANDIDATE")" = root:root:755:1 || caddy_activation_failed
+   caddy_candidate_sha256_record="$(/usr/bin/sha256sum "$CADDY_CANDIDATE")" || caddy_activation_failed
+   caddy_candidate_sha256=${caddy_candidate_sha256_record%% *}
+   test "$caddy_candidate_sha256" = "$CADDY_CANDIDATE_SHA256" || caddy_activation_failed
+   caddy_candidate_capabilities="$(/usr/sbin/getcap "$CADDY_CANDIDATE" 2> /dev/null)" || caddy_activation_failed
+   test -z "$caddy_candidate_capabilities" || caddy_activation_failed
+   unset caddy_candidate_capabilities
+   caddy_candidate_version_record="$("$CADDY_CANDIDATE" version)" || caddy_activation_failed
+   caddy_candidate_version=${caddy_candidate_version_record%% *}
+   test "$caddy_candidate_version" = v2.11.4 || caddy_activation_failed
+   unset caddy_candidate_version_record caddy_candidate_version
+   caddy_candidate_nonstandard_modules="$("$CADDY_CANDIDATE" list-modules --skip-standard --packages --versions)" || caddy_activation_failed
+   test -z "$caddy_candidate_nonstandard_modules" || caddy_activation_failed
+   unset caddy_candidate_nonstandard_modules
+   /usr/bin/sudo /usr/bin/test -f /var/backups/caddy-v2114-cutover/systemd-files-post-eryu.sha256 || caddy_activation_failed
+   /usr/bin/sudo /usr/bin/test ! -L /var/backups/caddy-v2114-cutover/systemd-files-post-eryu.sha256 || caddy_activation_failed
+   test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G:%a:%h' /var/backups/caddy-v2114-cutover/systemd-files-post-eryu.sha256)" = root:root:600:1 || caddy_activation_failed
+   /usr/bin/sudo /usr/bin/sha256sum --check --status /var/backups/caddy-v2114-cutover/systemd-files-post-eryu.sha256 || caddy_activation_failed
+   unset caddy_candidate_sha256_record caddy_candidate_sha256
    systemd_version_record="$(/usr/bin/systemd --version)" || caddy_activation_failed
    [[ "$systemd_version_record" =~ ^systemd[[:space:]]+([0-9]+) ]] || caddy_activation_failed
    systemd_major=${BASH_REMATCH[1]}
@@ -356,7 +405,7 @@ Shared Diary 回归和回滚细节见
      exit 1
    fi
    case "$caddy_exec_start_record" in
-     "{ path=/usr/bin/caddy ; argv[]=/usr/bin/caddy run --config /etc/caddy/Caddyfile ; ignore_errors=no ; "*)
+     "{ path=$CADDY_CANDIDATE ; argv[]=$CADDY_CANDIDATE run --config /etc/caddy/Caddyfile --adapter caddyfile ; ignore_errors=no ; "*)
        printf '%s\n' 'caddy_exec_start=approved_post_upgrade_form'
        ;;
      *)
@@ -379,7 +428,7 @@ Shared Diary 回归和回滚细节见
      exit 1
    fi
    case "$caddy_exec_start_ex_record" in
-     "{ path=/usr/bin/caddy ; argv[]=/usr/bin/caddy run --config /etc/caddy/Caddyfile ; flags= ; "*)
+     "{ path=$CADDY_CANDIDATE ; argv[]=$CADDY_CANDIDATE run --config /etc/caddy/Caddyfile --adapter caddyfile ; flags= ; "*)
        printf '%s\n' 'caddy_exec_start_ex=empty_flags'
        ;;
      *)
@@ -402,7 +451,7 @@ Shared Diary 回归和回滚细节见
      exit 1
    fi
    case "$caddy_exec_reload_record" in
-     "{ path=/usr/bin/caddy ; argv[]=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force --address unix//run/caddy/admin.sock ; ignore_errors=no ; "*)
+     "{ path=$CADDY_CANDIDATE ; argv[]=$CADDY_CANDIDATE reload --config /etc/caddy/Caddyfile --adapter caddyfile --force --address unix//run/caddy/admin.sock ; ignore_errors=no ; "*)
        printf '%s\n' 'caddy_exec_reload=approved_post_upgrade_form'
        ;;
      *)
@@ -425,7 +474,7 @@ Shared Diary 回归和回滚细节见
      exit 1
    fi
    case "$caddy_exec_reload_ex_record" in
-     "{ path=/usr/bin/caddy ; argv[]=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force --address unix//run/caddy/admin.sock ; flags= ; "*)
+     "{ path=$CADDY_CANDIDATE ; argv[]=$CADDY_CANDIDATE reload --config /etc/caddy/Caddyfile --adapter caddyfile --force --address unix//run/caddy/admin.sock ; flags= ; "*)
        printf '%s\n' 'caddy_exec_reload_ex=empty_flags'
        ;;
      *)
@@ -456,12 +505,26 @@ Shared Diary 回归和回滚细节见
    if test "$caddy_lifecycle_hooks" != absent; then
      exit 1
    fi
-   /usr/bin/sudo /usr/bin/systemd-run --quiet --wait --pipe --collect \
+   /usr/bin/sudo /usr/bin/systemd-run --quiet --wait --collect \
      --unit=eryu-caddy-base-validate \
      --property=Type=oneshot \
      --property=User=caddy \
      --property=Group=caddy \
-     /usr/bin/caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile || caddy_activation_failed
+     --property=RuntimeDirectory=eryu-caddy-base-validate \
+     --property=RuntimeDirectoryMode=0700 \
+     --property=RuntimeDirectoryPreserve=no \
+     --property=PrivateNetwork=yes \
+     --property=PrivateTmp=yes \
+     --property=ProtectHome=yes \
+     --property=ProtectSystem=strict \
+     --property=NoNewPrivileges=yes \
+     --property=UMask=0077 \
+     --property=StandardOutput=null \
+     --property=StandardError=null \
+     --setenv=HOME=/run/eryu-caddy-base-validate \
+     --setenv=XDG_CONFIG_HOME=/run/eryu-caddy-base-validate/config \
+     --setenv=XDG_DATA_HOME=/run/eryu-caddy-base-validate/data \
+     "$CADDY_CANDIDATE" validate --config /etc/caddy/Caddyfile --adapter caddyfile || caddy_activation_failed
    /usr/bin/sudo /usr/bin/systemctl daemon-reload || caddy_activation_failed
    caddy_effective_user="$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=User --value 2> /dev/null)" || caddy_activation_failed
    caddy_effective_group="$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=Group --value 2> /dev/null)" || caddy_activation_failed
@@ -529,7 +592,10 @@ Shared Diary 回归和回滚细节见
    # 下面的 restart 必须在取得该维护门的单独批准后才运行。
    /usr/bin/sudo /usr/bin/systemctl restart caddy.service || caddy_activation_failed
    /usr/bin/sudo /usr/bin/systemctl is-active --quiet caddy.service || caddy_activation_failed
-   test "$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=MainPID --value)" -gt 0 || caddy_activation_failed
+   caddy_main_pid="$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=MainPID --value)" || caddy_activation_failed
+   test "$caddy_main_pid" -gt 0 || caddy_activation_failed
+   test "$(/usr/bin/sudo /usr/bin/readlink -f "/proc/$caddy_main_pid/exe")" = "$CADDY_CANDIDATE" || caddy_activation_failed
+   unset caddy_main_pid
    /usr/bin/sudo /usr/bin/test -S /run/caddy/admin.sock || caddy_activation_failed
    /usr/bin/sudo /usr/bin/test -d /run/caddy || caddy_activation_failed
    /usr/bin/sudo /usr/bin/test ! -L /run/caddy || caddy_activation_failed
@@ -592,28 +658,83 @@ Shared Diary 回归和回滚细节见
    /usr/bin/sudo /usr/bin/test ! -L /var/backups/eryu-deploy || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/test -f /etc/caddy/Caddyfile || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/test ! -L /etc/caddy/Caddyfile || caddy_route_install_failed
+   /usr/bin/sudo /usr/bin/test -d /var/backups/caddy-v2114-cutover || caddy_route_install_failed
+   /usr/bin/sudo /usr/bin/test ! -L /var/backups/caddy-v2114-cutover || caddy_route_install_failed
+   test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G:%a' /var/backups/caddy-v2114-cutover)" = root:root:700 || caddy_route_install_failed
+   /usr/bin/sudo /usr/bin/test -f /var/backups/caddy-v2114-cutover/Caddyfile.post-v2114-approved || caddy_route_install_failed
+   /usr/bin/sudo /usr/bin/test ! -L /var/backups/caddy-v2114-cutover/Caddyfile.post-v2114-approved || caddy_route_install_failed
+   test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G:%a:%h' /var/backups/caddy-v2114-cutover/Caddyfile.post-v2114-approved)" = root:root:644:1 || caddy_route_install_failed
+   /usr/bin/sudo /usr/bin/cmp --silent /var/backups/caddy-v2114-cutover/Caddyfile.post-v2114-approved /etc/caddy/Caddyfile || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/test ! -e /var/backups/eryu-deploy/Caddyfile.pre-eryu || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/test ! -L /var/backups/eryu-deploy/Caddyfile.pre-eryu || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/test ! -e /var/backups/eryu-deploy/Caddyfile.expected-eryu || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/test ! -L /var/backups/eryu-deploy/Caddyfile.expected-eryu || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/test ! -e /etc/caddy/.Caddyfile.eryu-candidate || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/test ! -L /etc/caddy/.Caddyfile.eryu-candidate || caddy_route_install_failed
-   /usr/bin/sudo /usr/bin/cp --preserve=mode,ownership,timestamps /etc/caddy/Caddyfile /var/backups/eryu-deploy/Caddyfile.pre-eryu || caddy_route_install_failed
+   /usr/bin/sudo /usr/bin/cp --preserve=mode,ownership,timestamps /var/backups/caddy-v2114-cutover/Caddyfile.post-v2114-approved /var/backups/eryu-deploy/Caddyfile.pre-eryu || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/cp --preserve=mode,ownership,timestamps /var/backups/eryu-deploy/Caddyfile.pre-eryu /var/backups/eryu-deploy/Caddyfile.expected-eryu || caddy_route_install_failed
    printf '\nimport /etc/caddy/eryu.caddy\n' | /usr/bin/sudo /usr/bin/tee -a /var/backups/eryu-deploy/Caddyfile.expected-eryu > /dev/null || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/test ! -e /etc/caddy/eryu.caddy || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/test ! -L /etc/caddy/eryu.caddy || caddy_route_install_failed
+   eryu_caddy_source_sha_record="$(/usr/bin/sha256sum /opt/eryu/current/deploy/caddy/eryu.caddy)" || caddy_route_install_failed
+   test "${eryu_caddy_source_sha_record%% *}" = 23c29b8ec7b777f8858281e832ca257ff9200f2cb3d51e5640024a7eb1b3fed3 || caddy_route_install_failed
+   unset eryu_caddy_source_sha_record
    /usr/bin/sudo /usr/bin/install -o root -g root -m 0644 /opt/eryu/current/deploy/caddy/eryu.caddy /etc/caddy/eryu.caddy || caddy_route_install_failed
+   /usr/bin/sudo /usr/bin/cmp --silent /opt/eryu/current/deploy/caddy/eryu.caddy /etc/caddy/eryu.caddy || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/cp --preserve=mode,ownership,timestamps /var/backups/eryu-deploy/Caddyfile.expected-eryu /etc/caddy/.Caddyfile.eryu-candidate || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/cmp --silent /var/backups/eryu-deploy/Caddyfile.expected-eryu /etc/caddy/.Caddyfile.eryu-candidate || caddy_route_install_failed
-   /usr/bin/sudo /usr/bin/systemd-run --quiet --wait --pipe --collect \
+   /usr/bin/sudo /usr/bin/test -f /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256 || caddy_route_install_failed
+   /usr/bin/sudo /usr/bin/test ! -L /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256 || caddy_route_install_failed
+   test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G:%a:%h' /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256)" = root:root:600:1 || caddy_route_install_failed
+   /usr/bin/sudo /usr/bin/sha256sum --check --status /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256 || caddy_route_install_failed
+   /usr/bin/sudo /usr/bin/grep -rI -Eq '(^|[[:space:]])forward_auth([[:space:]]|$)' /etc/caddy > /dev/null 2>&1
+   caddy_route_forward_auth_status=$?
+   test "$caddy_route_forward_auth_status" -eq 1 || caddy_route_install_failed
+   unset caddy_route_forward_auth_status
+   for caddy_candidate_directory in /opt /opt/caddy-candidates /opt/caddy-candidates/v2.11.4; do
+     /usr/bin/test -d "$caddy_candidate_directory" || caddy_route_install_failed
+     /usr/bin/test ! -L "$caddy_candidate_directory" || caddy_route_install_failed
+     test "$(/usr/bin/stat -c '%U:%G:%a' "$caddy_candidate_directory")" = root:root:755 || caddy_route_install_failed
+   done
+   unset caddy_candidate_directory
+   /usr/bin/test -f /opt/caddy-candidates/v2.11.4/caddy || caddy_route_install_failed
+   /usr/bin/test ! -L /opt/caddy-candidates/v2.11.4/caddy || caddy_route_install_failed
+   test "$(/usr/bin/stat -c '%U:%G:%a:%h' /opt/caddy-candidates/v2.11.4/caddy)" = root:root:755:1 || caddy_route_install_failed
+   caddy_route_candidate_sha_record="$(/usr/bin/sha256sum /opt/caddy-candidates/v2.11.4/caddy)" || caddy_route_install_failed
+   test "${caddy_route_candidate_sha_record%% *}" = b7105518e3ed1c0761f232e44fc09345535533c9cb0abf0e12809416c7ac64d9 || caddy_route_install_failed
+   unset caddy_route_candidate_sha_record
+   test -x /usr/sbin/getcap || caddy_route_install_failed
+   caddy_route_candidate_capabilities="$(/usr/sbin/getcap /opt/caddy-candidates/v2.11.4/caddy 2> /dev/null)" || caddy_route_install_failed
+   test -z "$caddy_route_candidate_capabilities" || caddy_route_install_failed
+   unset caddy_route_candidate_capabilities
+   /usr/bin/sudo /usr/bin/systemd-run --quiet --wait --collect \
      --unit=eryu-caddy-validate \
      --property=Type=oneshot \
      --property=User=caddy \
      --property=Group=caddy \
+     --property=RuntimeDirectory=eryu-caddy-validate \
+     --property=RuntimeDirectoryMode=0700 \
+     --property=RuntimeDirectoryPreserve=no \
+     --property=PrivateNetwork=yes \
+     --property=PrivateTmp=yes \
+     --property=ProtectHome=yes \
+     --property=ProtectSystem=strict \
+     --property=NoNewPrivileges=yes \
+     --property=UMask=0077 \
+     --property=StandardOutput=null \
+     --property=StandardError=null \
+     --setenv=HOME=/run/eryu-caddy-validate \
+     --setenv=XDG_CONFIG_HOME=/run/eryu-caddy-validate/config \
+     --setenv=XDG_DATA_HOME=/run/eryu-caddy-validate/data \
      --property=LoadCredentialEncrypted=ERYU_BASIC_AUTH_ENTRY:/etc/credstore.encrypted/eryu/ERYU_BASIC_AUTH_ENTRY.cred \
-     /usr/bin/caddy validate --config /etc/caddy/.Caddyfile.eryu-candidate --adapter caddyfile || caddy_route_install_failed
+     /opt/caddy-candidates/v2.11.4/caddy validate --config /etc/caddy/.Caddyfile.eryu-candidate --adapter caddyfile || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/cmp --silent /var/backups/eryu-deploy/Caddyfile.pre-eryu /etc/caddy/Caddyfile || caddy_route_install_failed
+   /usr/bin/sudo /usr/bin/sha256sum --check --status /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256 || caddy_route_install_failed
+   /usr/bin/sudo /usr/bin/cmp --silent /opt/eryu/current/deploy/caddy/eryu.caddy /etc/caddy/eryu.caddy || caddy_route_install_failed
+   /usr/bin/sudo /usr/bin/grep -rI -Eq '(^|[[:space:]])forward_auth([[:space:]]|$)' /etc/caddy > /dev/null 2>&1
+   caddy_route_forward_auth_status=$?
+   test "$caddy_route_forward_auth_status" -eq 1 || caddy_route_install_failed
+   unset caddy_route_forward_auth_status
    /usr/bin/sudo /usr/bin/mv -T /etc/caddy/.Caddyfile.eryu-candidate /etc/caddy/Caddyfile || caddy_route_install_failed
    /usr/bin/sudo /usr/bin/cmp --silent /var/backups/eryu-deploy/Caddyfile.expected-eryu /etc/caddy/Caddyfile || caddy_route_install_failed
    unset -f caddy_route_install_failed
@@ -638,15 +759,110 @@ Shared Diary 回归和回滚细节见
 
    ```bash
    # 这些是最后写入阶段的命令，目前禁止执行。
+   set +x
    eryu_public_cutover_failed() {
      printf '%s\n' 'eryu_public_cutover=failed' >&2
      exit 1
    }
-   test "$(command -v curl)" = /usr/bin/curl || eryu_public_cutover_failed
+   test -z "${DBUS_SYSTEM_BUS_ADDRESS+x}" || eryu_public_cutover_failed
+   for eryu_public_tool in /usr/bin/busctl /usr/bin/curl /usr/bin/readlink /usr/bin/sha256sum /usr/bin/stat /usr/bin/sudo /usr/bin/systemctl /usr/sbin/getcap; do
+     test -x "$eryu_public_tool" || eryu_public_cutover_failed
+   done
+   unset eryu_public_tool
+   for caddy_candidate_directory in /opt /opt/caddy-candidates /opt/caddy-candidates/v2.11.4; do
+     /usr/bin/test -d "$caddy_candidate_directory" || eryu_public_cutover_failed
+     /usr/bin/test ! -L "$caddy_candidate_directory" || eryu_public_cutover_failed
+     test "$(/usr/bin/stat -c '%U:%G:%a' "$caddy_candidate_directory")" = root:root:755 || eryu_public_cutover_failed
+   done
+   unset caddy_candidate_directory
+   /usr/bin/test -f /opt/caddy-candidates/v2.11.4/caddy || eryu_public_cutover_failed
+   /usr/bin/test ! -L /opt/caddy-candidates/v2.11.4/caddy || eryu_public_cutover_failed
+   test "$(/usr/bin/stat -c '%U:%G:%a:%h' /opt/caddy-candidates/v2.11.4/caddy)" = root:root:755:1 || eryu_public_cutover_failed
+   caddy_public_candidate_sha_record="$(/usr/bin/sha256sum /opt/caddy-candidates/v2.11.4/caddy)" || eryu_public_cutover_failed
+   test "${caddy_public_candidate_sha_record%% *}" = b7105518e3ed1c0761f232e44fc09345535533c9cb0abf0e12809416c7ac64d9 || eryu_public_cutover_failed
+   unset caddy_public_candidate_sha_record
+   caddy_public_candidate_capabilities="$(/usr/sbin/getcap /opt/caddy-candidates/v2.11.4/caddy 2> /dev/null)" || eryu_public_cutover_failed
+   test -z "$caddy_public_candidate_capabilities" || eryu_public_cutover_failed
+   unset caddy_public_candidate_capabilities
+   caddy_public_main_pid="$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=MainPID --value 2> /dev/null)" || eryu_public_cutover_failed
+   test "$caddy_public_main_pid" -gt 0 || eryu_public_cutover_failed
+   test "$(/usr/bin/sudo /usr/bin/readlink -f "/proc/$caddy_public_main_pid/exe")" = /opt/caddy-candidates/v2.11.4/caddy || eryu_public_cutover_failed
+   unset caddy_public_main_pid
+   /usr/bin/sudo /usr/bin/test -f /var/backups/caddy-v2114-cutover/systemd-files-post-eryu.sha256 || eryu_public_cutover_failed
+   /usr/bin/sudo /usr/bin/test ! -L /var/backups/caddy-v2114-cutover/systemd-files-post-eryu.sha256 || eryu_public_cutover_failed
+   test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G:%a:%h' /var/backups/caddy-v2114-cutover/systemd-files-post-eryu.sha256)" = root:root:600:1 || eryu_public_cutover_failed
+   /usr/bin/sudo /usr/bin/sha256sum --check --status /var/backups/caddy-v2114-cutover/systemd-files-post-eryu.sha256 || eryu_public_cutover_failed
+   read -r -p 'Approved exact post-Eryu DropInPaths record: ' caddy_public_approved_drop_ins || eryu_public_cutover_failed
+   test -n "$caddy_public_approved_drop_ins" || eryu_public_cutover_failed
+   caddy_public_effective_drop_ins="$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=DropInPaths --value 2> /dev/null)" || eryu_public_cutover_failed
+   test "$caddy_public_effective_drop_ins" = "$caddy_public_approved_drop_ins" || eryu_public_cutover_failed
+   case " $caddy_public_effective_drop_ins " in
+     *" /etc/systemd/system/caddy.service.d/caddy-v2114-candidate.conf "*) ;;
+     *) eryu_public_cutover_failed ;;
+   esac
+   case " $caddy_public_effective_drop_ins " in
+     *" /etc/systemd/system/caddy.service.d/eryu-credentials.conf "*) ;;
+     *) eryu_public_cutover_failed ;;
+   esac
+   test "$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=NeedDaemonReload --value 2> /dev/null)" = no || eryu_public_cutover_failed
+   test "$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=User --value 2> /dev/null)" = caddy || eryu_public_cutover_failed
+   test "$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=Group --value 2> /dev/null)" = caddy || eryu_public_cutover_failed
+   caddy_public_expect_bus_property() {
+     local property_name=$1
+     local expected_record=$2
+     local effective_record
+     effective_record="$(/usr/bin/busctl --system get-property org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/caddy_2eservice org.freedesktop.systemd1.Service "$property_name" 2> /dev/null)" || eryu_public_cutover_failed
+     test "$effective_record" = "$expected_record" || eryu_public_cutover_failed
+   }
+   caddy_public_expect_bus_property Environment 'as 0'
+   caddy_public_expect_bus_property EnvironmentFiles 'a(sb) 0'
+   caddy_public_expect_bus_property PassEnvironment 'as 0'
+   caddy_public_expect_bus_property LoadCredential 'a(ss) 0'
+   caddy_public_expect_bus_property ImportCredential 'as 0'
+   caddy_public_expect_bus_property SetCredential 'a(say) 0'
+   caddy_public_expect_bus_property SetCredentialEncrypted 'a(say) 0'
+   caddy_public_expect_bus_property LoadCredentialEncrypted 'a(ss) 1 "ERYU_BASIC_AUTH_ENTRY" "/etc/credstore.encrypted/eryu/ERYU_BASIC_AUTH_ENTRY.cred"'
+   for caddy_public_reload_property in ExecStart ExecStartEx ExecReload ExecReloadEx; do
+     caddy_public_reload_record="$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property="$caddy_public_reload_property" --value 2> /dev/null)" || eryu_public_cutover_failed
+     caddy_public_reload_remainder=${caddy_public_reload_record#* path=}
+     test "$caddy_public_reload_remainder" != "$caddy_public_reload_record" || eryu_public_cutover_failed
+     [[ "$caddy_public_reload_remainder" != *" path="* ]] || eryu_public_cutover_failed
+     case "$caddy_public_reload_property:$caddy_public_reload_record" in
+       "ExecStart:{ path=/opt/caddy-candidates/v2.11.4/caddy ; argv[]=/opt/caddy-candidates/v2.11.4/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile ; ignore_errors=no ; "*) ;;
+       "ExecStartEx:{ path=/opt/caddy-candidates/v2.11.4/caddy ; argv[]=/opt/caddy-candidates/v2.11.4/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile ; flags= ; "*) ;;
+       "ExecReload:{ path=/opt/caddy-candidates/v2.11.4/caddy ; argv[]=/opt/caddy-candidates/v2.11.4/caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --force --address unix//run/caddy/admin.sock ; ignore_errors=no ; "*) ;;
+       "ExecReloadEx:{ path=/opt/caddy-candidates/v2.11.4/caddy ; argv[]=/opt/caddy-candidates/v2.11.4/caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --force --address unix//run/caddy/admin.sock ; flags= ; "*) ;;
+       *) eryu_public_cutover_failed ;;
+     esac
+   done
+   for caddy_public_hook_property in ExecCondition ExecConditionEx ExecStartPre ExecStartPreEx ExecStartPost ExecStartPostEx ExecStop ExecStopEx ExecStopPost ExecStopPostEx; do
+     test -z "$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property="$caddy_public_hook_property" --value 2> /dev/null)" || eryu_public_cutover_failed
+   done
+   unset caddy_public_approved_drop_ins caddy_public_effective_drop_ins
+   unset caddy_public_reload_property caddy_public_reload_record caddy_public_reload_remainder
+   unset caddy_public_hook_property
+   unset -f caddy_public_expect_bus_property
+   /usr/bin/sudo /usr/bin/test -f /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256 || eryu_public_cutover_failed
+   /usr/bin/sudo /usr/bin/test ! -L /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256 || eryu_public_cutover_failed
+   test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G:%a:%h' /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256)" = root:root:600:1 || eryu_public_cutover_failed
+   /usr/bin/sudo /usr/bin/sha256sum --check --status /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256 || eryu_public_cutover_failed
+   /usr/bin/sudo /usr/bin/cmp --silent /var/backups/eryu-deploy/Caddyfile.expected-eryu /etc/caddy/Caddyfile || eryu_public_cutover_failed
+   /usr/bin/sudo /usr/bin/cmp --silent /opt/eryu/current/deploy/caddy/eryu.caddy /etc/caddy/eryu.caddy || eryu_public_cutover_failed
+   /usr/bin/sudo /usr/bin/grep -rI -Eq '(^|[[:space:]])forward_auth([[:space:]]|$)' /etc/caddy > /dev/null 2>&1
+   caddy_public_forward_auth_status=$?
+   test "$caddy_public_forward_auth_status" -eq 1 || eryu_public_cutover_failed
+   unset caddy_public_forward_auth_status
    /usr/bin/sudo /usr/bin/systemctl enable --now eryu-web.service || eryu_public_cutover_failed
    test "$(/usr/bin/curl --fail --silent --show-error http://127.0.0.1:9090/health)" = "ok" || eryu_public_cutover_failed
    /usr/bin/sudo /usr/bin/systemctl enable --now eryu-mcp.service || eryu_public_cutover_failed
    /usr/bin/curl --fail --silent --show-error --output /dev/null http://127.0.0.1:9091/.well-known/oauth-protected-resource || eryu_public_cutover_failed
+   /usr/bin/sudo /usr/bin/sha256sum --check --status /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256 || eryu_public_cutover_failed
+   /usr/bin/sudo /usr/bin/cmp --silent /var/backups/eryu-deploy/Caddyfile.expected-eryu /etc/caddy/Caddyfile || eryu_public_cutover_failed
+   /usr/bin/sudo /usr/bin/cmp --silent /opt/eryu/current/deploy/caddy/eryu.caddy /etc/caddy/eryu.caddy || eryu_public_cutover_failed
+   /usr/bin/sudo /usr/bin/grep -rI -Eq '(^|[[:space:]])forward_auth([[:space:]]|$)' /etc/caddy > /dev/null 2>&1
+   caddy_public_forward_auth_status=$?
+   test "$caddy_public_forward_auth_status" -eq 1 || eryu_public_cutover_failed
+   unset caddy_public_forward_auth_status
    /usr/bin/sudo /usr/bin/systemctl reload caddy.service || eryu_public_cutover_failed
    test "$(/usr/bin/sudo /usr/bin/grep -Ec '^[[:space:]]*persist_config[[:space:]]+off[[:space:]]*$' /etc/caddy/Caddyfile)" = 1 || eryu_public_cutover_failed
    test "$(/usr/bin/curl --fail --silent --show-error https://eryu.95.169.17.214.sslip.io/health)" = "ok" || eryu_public_cutover_failed
@@ -689,10 +905,16 @@ Shared Diary 回归和回滚细节见
 
 ```bash
 # 仅在另行批准后于 VPS SSH 终端运行。
+set +x
 caddy_route_rollback_failed() {
   printf '%s\n' 'eryu_caddy_route_rollback=failed' >&2
   exit 1
 }
+test -z "${DBUS_SYSTEM_BUS_ADDRESS+x}" || caddy_route_rollback_failed
+for caddy_rollback_tool in /usr/bin/busctl /usr/bin/readlink /usr/bin/sha256sum /usr/bin/stat /usr/bin/sudo /usr/bin/systemctl /usr/sbin/getcap; do
+  test -x "$caddy_rollback_tool" || caddy_route_rollback_failed
+done
+unset caddy_rollback_tool
 /usr/bin/sudo /usr/bin/test -d /etc/caddy || caddy_route_rollback_failed
 /usr/bin/sudo /usr/bin/test ! -L /etc/caddy || caddy_route_rollback_failed
 test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G' /etc/caddy)" = root:root || caddy_route_rollback_failed
@@ -700,32 +922,148 @@ caddy_dir_mode="$(/usr/bin/sudo /usr/bin/stat -c '%a' /etc/caddy)" || caddy_rout
 [[ "$caddy_dir_mode" =~ ^[0-7]{3,4}$ ]] || caddy_route_rollback_failed
 test "$((8#$caddy_dir_mode & 0022))" -eq 0 || caddy_route_rollback_failed
 unset caddy_dir_mode
+/usr/bin/sudo /usr/bin/test -d /var/backups/eryu-deploy || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/test ! -L /var/backups/eryu-deploy || caddy_route_rollback_failed
+test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G:%a' /var/backups/eryu-deploy)" = root:root:700 || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/test -d /var/backups/caddy-v2114-cutover || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/test ! -L /var/backups/caddy-v2114-cutover || caddy_route_rollback_failed
+test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G:%a' /var/backups/caddy-v2114-cutover)" = root:root:700 || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/test -f /var/backups/caddy-v2114-cutover/Caddyfile.post-v2114-approved || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/test ! -L /var/backups/caddy-v2114-cutover/Caddyfile.post-v2114-approved || caddy_route_rollback_failed
+test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G:%a:%h' /var/backups/caddy-v2114-cutover/Caddyfile.post-v2114-approved)" = root:root:644:1 || caddy_route_rollback_failed
 /usr/bin/sudo /usr/bin/test -f /var/backups/eryu-deploy/Caddyfile.pre-eryu || caddy_route_rollback_failed
 /usr/bin/sudo /usr/bin/test ! -L /var/backups/eryu-deploy/Caddyfile.pre-eryu || caddy_route_rollback_failed
+test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G:%a:%h' /var/backups/eryu-deploy/Caddyfile.pre-eryu)" = root:root:644:1 || caddy_route_rollback_failed
 /usr/bin/sudo /usr/bin/test -f /var/backups/eryu-deploy/Caddyfile.expected-eryu || caddy_route_rollback_failed
 /usr/bin/sudo /usr/bin/test ! -L /var/backups/eryu-deploy/Caddyfile.expected-eryu || caddy_route_rollback_failed
+test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G:%a:%h' /var/backups/eryu-deploy/Caddyfile.expected-eryu)" = root:root:644:1 || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/cmp --silent /var/backups/caddy-v2114-cutover/Caddyfile.post-v2114-approved /var/backups/eryu-deploy/Caddyfile.pre-eryu || caddy_route_rollback_failed
 /usr/bin/sudo /usr/bin/test ! -e /etc/caddy/.Caddyfile.eryu-rollback || caddy_route_rollback_failed
 /usr/bin/sudo /usr/bin/test ! -L /etc/caddy/.Caddyfile.eryu-rollback || caddy_route_rollback_failed
 /usr/bin/sudo /usr/bin/cp --preserve=mode,ownership,timestamps /var/backups/eryu-deploy/Caddyfile.pre-eryu /etc/caddy/.Caddyfile.eryu-rollback || caddy_route_rollback_failed
-/usr/bin/sudo /usr/bin/systemd-run --quiet --wait --pipe --collect \
+for caddy_candidate_directory in /opt /opt/caddy-candidates /opt/caddy-candidates/v2.11.4; do
+  /usr/bin/test -d "$caddy_candidate_directory" || caddy_route_rollback_failed
+  /usr/bin/test ! -L "$caddy_candidate_directory" || caddy_route_rollback_failed
+  test "$(/usr/bin/stat -c '%U:%G:%a' "$caddy_candidate_directory")" = root:root:755 || caddy_route_rollback_failed
+done
+unset caddy_candidate_directory
+/usr/bin/test -f /opt/caddy-candidates/v2.11.4/caddy || caddy_route_rollback_failed
+/usr/bin/test ! -L /opt/caddy-candidates/v2.11.4/caddy || caddy_route_rollback_failed
+test "$(/usr/bin/stat -c '%U:%G:%a:%h' /opt/caddy-candidates/v2.11.4/caddy)" = root:root:755:1 || caddy_route_rollback_failed
+caddy_route_rollback_candidate_sha_record="$(/usr/bin/sha256sum /opt/caddy-candidates/v2.11.4/caddy)" || caddy_route_rollback_failed
+test "${caddy_route_rollback_candidate_sha_record%% *}" = b7105518e3ed1c0761f232e44fc09345535533c9cb0abf0e12809416c7ac64d9 || caddy_route_rollback_failed
+unset caddy_route_rollback_candidate_sha_record
+caddy_route_rollback_candidate_capabilities="$(/usr/sbin/getcap /opt/caddy-candidates/v2.11.4/caddy 2> /dev/null)" || caddy_route_rollback_failed
+test -z "$caddy_route_rollback_candidate_capabilities" || caddy_route_rollback_failed
+unset caddy_route_rollback_candidate_capabilities
+caddy_route_rollback_main_pid="$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=MainPID --value 2> /dev/null)" || caddy_route_rollback_failed
+test "$caddy_route_rollback_main_pid" -gt 0 || caddy_route_rollback_failed
+test "$(/usr/bin/sudo /usr/bin/readlink -f "/proc/$caddy_route_rollback_main_pid/exe")" = /opt/caddy-candidates/v2.11.4/caddy || caddy_route_rollback_failed
+unset caddy_route_rollback_main_pid
+/usr/bin/sudo /usr/bin/test -f /var/backups/caddy-v2114-cutover/systemd-files-post-eryu.sha256 || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/test ! -L /var/backups/caddy-v2114-cutover/systemd-files-post-eryu.sha256 || caddy_route_rollback_failed
+test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G:%a:%h' /var/backups/caddy-v2114-cutover/systemd-files-post-eryu.sha256)" = root:root:600:1 || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/sha256sum --check --status /var/backups/caddy-v2114-cutover/systemd-files-post-eryu.sha256 || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/systemd-run --quiet --wait --collect \
   --unit=eryu-caddy-rollback-validate \
   --property=Type=oneshot \
   --property=User=caddy \
   --property=Group=caddy \
-  /usr/bin/caddy validate --config /etc/caddy/.Caddyfile.eryu-rollback --adapter caddyfile || caddy_route_rollback_failed
+  --property=RuntimeDirectory=eryu-caddy-rollback-validate \
+  --property=RuntimeDirectoryMode=0700 \
+  --property=RuntimeDirectoryPreserve=no \
+  --property=PrivateNetwork=yes \
+  --property=PrivateTmp=yes \
+  --property=ProtectHome=yes \
+  --property=ProtectSystem=strict \
+  --property=NoNewPrivileges=yes \
+  --property=UMask=0077 \
+  --property=StandardOutput=null \
+  --property=StandardError=null \
+  --setenv=HOME=/run/eryu-caddy-rollback-validate \
+  --setenv=XDG_CONFIG_HOME=/run/eryu-caddy-rollback-validate/config \
+  --setenv=XDG_DATA_HOME=/run/eryu-caddy-rollback-validate/data \
+  /opt/caddy-candidates/v2.11.4/caddy validate --config /etc/caddy/.Caddyfile.eryu-rollback --adapter caddyfile || caddy_route_rollback_failed
+read -r -p 'Approved exact post-Eryu DropInPaths record: ' caddy_rollback_approved_drop_ins || caddy_route_rollback_failed
+test -n "$caddy_rollback_approved_drop_ins" || caddy_route_rollback_failed
+caddy_rollback_effective_drop_ins="$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=DropInPaths --value 2> /dev/null)" || caddy_route_rollback_failed
+test "$caddy_rollback_effective_drop_ins" = "$caddy_rollback_approved_drop_ins" || caddy_route_rollback_failed
+case " $caddy_rollback_effective_drop_ins " in
+  *" /etc/systemd/system/caddy.service.d/caddy-v2114-candidate.conf "*) ;;
+  *) caddy_route_rollback_failed ;;
+esac
+case " $caddy_rollback_effective_drop_ins " in
+  *" /etc/systemd/system/caddy.service.d/eryu-credentials.conf "*) ;;
+  *) caddy_route_rollback_failed ;;
+esac
+test "$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=NeedDaemonReload --value 2> /dev/null)" = no || caddy_route_rollback_failed
+test "$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=User --value 2> /dev/null)" = caddy || caddy_route_rollback_failed
+test "$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property=Group --value 2> /dev/null)" = caddy || caddy_route_rollback_failed
+caddy_rollback_expect_bus_property() {
+  local property_name=$1
+  local expected_record=$2
+  local effective_record
+  effective_record="$(/usr/bin/busctl --system get-property org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/caddy_2eservice org.freedesktop.systemd1.Service "$property_name" 2> /dev/null)" || caddy_route_rollback_failed
+  test "$effective_record" = "$expected_record" || caddy_route_rollback_failed
+}
+caddy_rollback_expect_bus_property Environment 'as 0'
+caddy_rollback_expect_bus_property EnvironmentFiles 'a(sb) 0'
+caddy_rollback_expect_bus_property PassEnvironment 'as 0'
+caddy_rollback_expect_bus_property LoadCredential 'a(ss) 0'
+caddy_rollback_expect_bus_property ImportCredential 'as 0'
+caddy_rollback_expect_bus_property SetCredential 'a(say) 0'
+caddy_rollback_expect_bus_property SetCredentialEncrypted 'a(say) 0'
+caddy_rollback_expect_bus_property LoadCredentialEncrypted 'a(ss) 1 "ERYU_BASIC_AUTH_ENTRY" "/etc/credstore.encrypted/eryu/ERYU_BASIC_AUTH_ENTRY.cred"'
+for caddy_rollback_reload_property in ExecStart ExecStartEx ExecReload ExecReloadEx; do
+  caddy_rollback_reload_record="$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property="$caddy_rollback_reload_property" --value 2> /dev/null)" || caddy_route_rollback_failed
+  caddy_rollback_reload_remainder=${caddy_rollback_reload_record#* path=}
+  test "$caddy_rollback_reload_remainder" != "$caddy_rollback_reload_record" || caddy_route_rollback_failed
+  [[ "$caddy_rollback_reload_remainder" != *" path="* ]] || caddy_route_rollback_failed
+  case "$caddy_rollback_reload_property:$caddy_rollback_reload_record" in
+    "ExecStart:{ path=/opt/caddy-candidates/v2.11.4/caddy ; argv[]=/opt/caddy-candidates/v2.11.4/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile ; ignore_errors=no ; "*) ;;
+    "ExecStartEx:{ path=/opt/caddy-candidates/v2.11.4/caddy ; argv[]=/opt/caddy-candidates/v2.11.4/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile ; flags= ; "*) ;;
+    "ExecReload:{ path=/opt/caddy-candidates/v2.11.4/caddy ; argv[]=/opt/caddy-candidates/v2.11.4/caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --force --address unix//run/caddy/admin.sock ; ignore_errors=no ; "*) ;;
+    "ExecReloadEx:{ path=/opt/caddy-candidates/v2.11.4/caddy ; argv[]=/opt/caddy-candidates/v2.11.4/caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --force --address unix//run/caddy/admin.sock ; flags= ; "*) ;;
+    *) caddy_route_rollback_failed ;;
+  esac
+done
+for caddy_rollback_hook_property in ExecCondition ExecConditionEx ExecStartPre ExecStartPreEx ExecStartPost ExecStartPostEx ExecStop ExecStopEx ExecStopPost ExecStopPostEx; do
+  test -z "$(/usr/bin/sudo /usr/bin/systemctl show caddy.service --property="$caddy_rollback_hook_property" --value 2> /dev/null)" || caddy_route_rollback_failed
+done
+unset caddy_rollback_approved_drop_ins caddy_rollback_effective_drop_ins
+unset caddy_rollback_reload_property caddy_rollback_reload_record caddy_rollback_reload_remainder
+unset caddy_rollback_hook_property
+unset -f caddy_rollback_expect_bus_property
+/usr/bin/sudo /usr/bin/test -f /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256 || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/test ! -L /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256 || caddy_route_rollback_failed
+test "$(/usr/bin/sudo /usr/bin/stat -c '%U:%G:%a:%h' /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256)" = root:root:600:1 || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/sha256sum --check --status /var/backups/caddy-v2114-cutover/shared-diary-imports.sha256 || caddy_route_rollback_failed
 /usr/bin/sudo /usr/bin/cmp --silent /var/backups/eryu-deploy/Caddyfile.expected-eryu /etc/caddy/Caddyfile || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/cmp --silent /opt/eryu/current/deploy/caddy/eryu.caddy /etc/caddy/eryu.caddy || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/cmp --silent /var/backups/caddy-v2114-cutover/Caddyfile.post-v2114-approved /var/backups/eryu-deploy/Caddyfile.pre-eryu || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/grep -rI -Eq '(^|[[:space:]])forward_auth([[:space:]]|$)' /etc/caddy > /dev/null 2>&1
+caddy_route_rollback_forward_auth_status=$?
+test "$caddy_route_rollback_forward_auth_status" -eq 1 || caddy_route_rollback_failed
+unset caddy_route_rollback_forward_auth_status
 /usr/bin/sudo /usr/bin/mv -T /etc/caddy/.Caddyfile.eryu-rollback /etc/caddy/Caddyfile || caddy_route_rollback_failed
 /usr/bin/sudo /usr/bin/cmp --silent /var/backups/eryu-deploy/Caddyfile.pre-eryu /etc/caddy/Caddyfile || caddy_route_rollback_failed
 /usr/bin/sudo /usr/bin/rm -f /etc/caddy/eryu.caddy || caddy_route_rollback_failed
+/usr/bin/sudo /usr/bin/grep -rI -Eq '(^|[[:space:]])forward_auth([[:space:]]|$)' /etc/caddy > /dev/null 2>&1
+caddy_route_rollback_forward_auth_status=$?
+test "$caddy_route_rollback_forward_auth_status" -eq 1 || caddy_route_rollback_failed
+unset caddy_route_rollback_forward_auth_status
 /usr/bin/sudo /usr/bin/systemctl reload caddy.service || caddy_route_rollback_failed
 unset -f caddy_route_rollback_failed
 ```
 
-上面的路由回退只撤销 Eryu import，保留已经完成并验证过的 Caddy 升级、根
+上面的路由回退只撤销 Eryu import，仍由固定候选路径完成 validate，并保留已经
+完成并验证过的 Caddy 升级、根
 global block 中的 `persist_config off`、credential drop-in 和加密凭据。是否
 移除 credential drop-in/加密凭据必须另行确认；不得顺带改变 Shared Diary。
 
 如果问题来自 Caddy 新二进制或 Shared Diary 兼容性，而不是 Eryu 路由，则不
 使用上面的路由回退命令。应按 [`CADDY-UPGRADE.md`](CADDY-UPGRADE.md) 中的
-二进制回滚门，恢复升级前的精确 package/二进制、unit/drop-in 与 Caddyfile，
-用旧二进制验证后再经单独批准 restart。两类回退都不得自动执行。
+二进制回滚门，恢复升级前的精确 Caddyfile、unit/drop-in，使 systemd 重新指向
+仍未被覆盖的 `/usr/bin/caddy` v2.6.2，并用旧入口验证后执行获批的单次 restart。
+两类回退都不得在本轮执行；只有该维护审批明确包含第 8 节的一次性条件式回滚
+时，才可按其两个精确 trigger 自动进入一次回滚事务。
