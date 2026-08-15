@@ -179,17 +179,45 @@ if ! caddy_fragment_path="$(
 )"; then
   readonly_gate_failed
 fi
+caddy_fragment_lib_path=/lib/systemd/system/caddy.service
+caddy_fragment_usr_lib_path=/usr/lib/systemd/system/caddy.service
 case "$caddy_fragment_path" in
-  /lib/systemd/system/caddy.service|/usr/lib/systemd/system/caddy.service) ;;
+  "$caddy_fragment_lib_path"|"$caddy_fragment_usr_lib_path") ;;
   *)
     printf '%s\n' 'caddy_fragment_path=unapproved' >&2
     exit 1
     ;;
 esac
 resolved_caddy_fragment="$(/usr/bin/readlink -f "$caddy_fragment_path")" || readonly_gate_failed
+resolved_caddy_fragment_lib="$(/usr/bin/readlink -f "$caddy_fragment_lib_path")" || readonly_gate_failed
+resolved_caddy_fragment_usr_lib="$(/usr/bin/readlink -f "$caddy_fragment_usr_lib_path")" || readonly_gate_failed
 test -f "$resolved_caddy_fragment" || readonly_gate_failed
+test -f "$caddy_fragment_lib_path" || readonly_gate_failed
+test -f "$caddy_fragment_usr_lib_path" || readonly_gate_failed
 test ! -L "$caddy_fragment_path" || readonly_gate_failed
 test ! -L "$resolved_caddy_fragment" || readonly_gate_failed
+test ! -L "$caddy_fragment_lib_path" || readonly_gate_failed
+test ! -L "$caddy_fragment_usr_lib_path" || readonly_gate_failed
+test "$resolved_caddy_fragment" = "$resolved_caddy_fragment_lib" || readonly_gate_failed
+test "$resolved_caddy_fragment" = "$resolved_caddy_fragment_usr_lib" || readonly_gate_failed
+caddy_fragment_identity="$(/usr/bin/stat -Lc '%d:%i' "$caddy_fragment_path")" || readonly_gate_failed
+caddy_fragment_lib_identity="$(/usr/bin/stat -Lc '%d:%i' "$caddy_fragment_lib_path")" || readonly_gate_failed
+caddy_fragment_usr_lib_identity="$(/usr/bin/stat -Lc '%d:%i' "$caddy_fragment_usr_lib_path")" || readonly_gate_failed
+[[ "$caddy_fragment_identity" =~ ^[0-9]+:[0-9]+$ ]] || readonly_gate_failed
+[[ "$caddy_fragment_lib_identity" =~ ^[0-9]+:[0-9]+$ ]] || readonly_gate_failed
+[[ "$caddy_fragment_usr_lib_identity" =~ ^[0-9]+:[0-9]+$ ]] || readonly_gate_failed
+test "$caddy_fragment_identity" = "$caddy_fragment_lib_identity" || readonly_gate_failed
+test "$caddy_fragment_identity" = "$caddy_fragment_usr_lib_identity" || readonly_gate_failed
+caddy_fragment_sha_record="$(/usr/bin/sha256sum "$resolved_caddy_fragment")" || readonly_gate_failed
+caddy_fragment_sha256=${caddy_fragment_sha_record%% *}
+caddy_fragment_lib_sha_record="$(/usr/bin/sha256sum "$caddy_fragment_lib_path")" || readonly_gate_failed
+caddy_fragment_lib_sha256=${caddy_fragment_lib_sha_record%% *}
+caddy_fragment_usr_lib_sha_record="$(/usr/bin/sha256sum "$caddy_fragment_usr_lib_path")" || readonly_gate_failed
+caddy_fragment_usr_lib_sha256=${caddy_fragment_usr_lib_sha_record%% *}
+[[ "$caddy_fragment_sha256" =~ ^[0-9a-f]{64}$ ]] || readonly_gate_failed
+test "$caddy_fragment_sha256" = "$caddy_fragment_lib_sha256" || readonly_gate_failed
+test "$caddy_fragment_sha256" = "$caddy_fragment_usr_lib_sha256" || readonly_gate_failed
+printf '%s\n' 'caddy_unit_fragment_aliases=equivalent'
 test "$(/usr/bin/stat -c '%U:%G' "$resolved_caddy_fragment")" = root:root || readonly_gate_failed
 caddy_fragment_mode="$(/usr/bin/stat -c '%a' "$resolved_caddy_fragment")" || readonly_gate_failed
 [[ "$caddy_fragment_mode" =~ ^[0-7]{3,4}$ ]] || readonly_gate_failed
@@ -199,17 +227,32 @@ test "$(/usr/bin/stat -c '%U:%G' "$caddy_fragment_parent")" = root:root || reado
 caddy_fragment_parent_mode="$(/usr/bin/stat -c '%a' "$caddy_fragment_parent")" || readonly_gate_failed
 [[ "$caddy_fragment_parent_mode" =~ ^[0-7]{3,4}$ ]] || readonly_gate_failed
 test "$((8#$caddy_fragment_parent_mode & 0022))" -eq 0 || readonly_gate_failed
-caddy_fragment_package_record="$(
-  /usr/bin/dpkg-query -S "$caddy_fragment_path"
-)" || readonly_gate_failed
-test "${caddy_fragment_package_record%%:*}" = caddy || readonly_gate_failed
-caddy_fragment_sha_record="$(/usr/bin/sha256sum "$resolved_caddy_fragment")" || readonly_gate_failed
-caddy_fragment_sha256=${caddy_fragment_sha_record%% *}
-[[ "$caddy_fragment_sha256" =~ ^[0-9a-f]{64}$ ]] || readonly_gate_failed
+caddy_fragment_package_match=absent
+for caddy_fragment_package_path in \
+  "$caddy_fragment_lib_path" "$caddy_fragment_usr_lib_path"; do
+  if caddy_fragment_package_record="$(
+    /usr/bin/dpkg-query -S "$caddy_fragment_package_path" 2> /dev/null
+  )"; then
+    [[ "$caddy_fragment_package_record" != *$'\n'* ]] || readonly_gate_failed
+    test "${caddy_fragment_package_record%%:*}" = caddy || readonly_gate_failed
+    caddy_fragment_package_match=present
+  else
+    caddy_fragment_package_status=$?
+    test "$caddy_fragment_package_status" -eq 1 || readonly_gate_failed
+  fi
+  unset caddy_fragment_package_record caddy_fragment_package_status
+done
+test "$caddy_fragment_package_match" = present || readonly_gate_failed
 printf 'caddy_unit_fragment=approved sha256=%s\n' "$caddy_fragment_sha256"
-unset caddy_fragment_path resolved_caddy_fragment caddy_fragment_mode
+unset caddy_fragment_path caddy_fragment_lib_path caddy_fragment_usr_lib_path
+unset resolved_caddy_fragment resolved_caddy_fragment_lib resolved_caddy_fragment_usr_lib
+unset caddy_fragment_identity caddy_fragment_lib_identity caddy_fragment_usr_lib_identity
+unset caddy_fragment_mode
 unset caddy_fragment_parent caddy_fragment_parent_mode
-unset caddy_fragment_package_record caddy_fragment_sha_record caddy_fragment_sha256
+unset caddy_fragment_package_path caddy_fragment_package_match
+unset caddy_fragment_sha_record caddy_fragment_sha256
+unset caddy_fragment_lib_sha_record caddy_fragment_lib_sha256
+unset caddy_fragment_usr_lib_sha_record caddy_fragment_usr_lib_sha256
 
 if ! caddy_drop_in_paths="$(
   /usr/bin/sudo /usr/bin/systemctl show caddy.service \
@@ -460,7 +503,10 @@ unset -f readonly_gate_failed
 
 结果判定：
 
-- `dpkg-query -S` 失败：按静态/自定义二进制处理，停止 apt 升级方案。
+- 两条 vendor unit 别名只有在 `readlink -f` 真实路径、device/inode 与 SHA-256
+  全部相同时才视为同一文件；其中至少一条精确路径还必须由 `caddy` package
+  登记。任一等价检查失败或两条路径均无法由 `dpkg-query -S` 归属时，按未知
+  unit 来源停止，不能因为 usr-merge 路径差异直接接受。
 - 模块列表出现非标准模块：先逐项确认 Shared Diary 是否依赖；候选缺任一必要
   模块就停止。
 - `ExecStart` 不是 file-backed `caddy run --config /etc/caddy/Caddyfile`，或含

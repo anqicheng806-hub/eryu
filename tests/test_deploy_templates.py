@@ -266,6 +266,7 @@ class DeploymentTemplateTest(unittest.TestCase):
         self.assertIn("caddy_existing_drop_ins=absent", upgrade_plan)
         self.assertIn("caddy_existing_runtime_directory=absent", upgrade_plan)
         self.assertIn("caddy_unit_fragment=approved sha256=", upgrade_plan)
+        self.assertIn("caddy_unit_fragment_aliases=equivalent", upgrade_plan)
         self.assertIn("官方 Release archive", upgrade_plan)
         self.assertIn("dpkg metadata 只盘点旧", upgrade_plan)
         self.assertIn("RuntimeDirectory=caddy", upgrade_plan)
@@ -279,6 +280,7 @@ class DeploymentTemplateTest(unittest.TestCase):
         self.assertIn(CADDY_CANDIDATE, upgrade_plan)
         self.assertIn(CADDY_CANDIDATE_SHA256, plan)
         self.assertIn(CADDY_CANDIDATE_SHA256, upgrade_plan)
+
         self.assertIn(CADDY_ASSET_SHA256, upgrade_plan)
         self.assertIn(
             "https://github.com/caddyserver/caddy/.github/workflows/release.yml@"
@@ -316,6 +318,94 @@ class DeploymentTemplateTest(unittest.TestCase):
         self.assertIn("root:root:700", helper)
         self.assertIn("20-72 bytes", helper)
         self.assertNotIn('command -v "$required_command"', helper)
+
+    def test_caddy_vendor_unit_usrmerge_aliases_require_full_equivalence(self) -> None:
+        upgrade_plan = self.read("CADDY-UPGRADE.md")
+        readonly_section = upgrade_plan.split(
+            "## 3. 下一次 VPS 只读盘点（必须先单独批准）", 1
+        )[1].split("## 4.", 1)[0]
+        lib_path = "/lib/systemd/system/caddy.service"
+        usr_lib_path = "/usr/lib/systemd/system/caddy.service"
+
+        self.assertIn(f"caddy_fragment_lib_path={lib_path}", readonly_section)
+        self.assertIn(
+            f"caddy_fragment_usr_lib_path={usr_lib_path}", readonly_section
+        )
+        for record in (
+            'resolved_caddy_fragment="$(/usr/bin/readlink -f '
+            '"$caddy_fragment_path")"',
+            'resolved_caddy_fragment_lib="$(/usr/bin/readlink -f '
+            '"$caddy_fragment_lib_path")"',
+            'resolved_caddy_fragment_usr_lib="$(/usr/bin/readlink -f '
+            '"$caddy_fragment_usr_lib_path")"',
+            'caddy_fragment_identity="$(/usr/bin/stat -Lc \'%d:%i\' '
+            '"$caddy_fragment_path")"',
+            'caddy_fragment_lib_identity="$(/usr/bin/stat -Lc \'%d:%i\' '
+            '"$caddy_fragment_lib_path")"',
+            'caddy_fragment_usr_lib_identity="$(/usr/bin/stat -Lc \'%d:%i\' '
+            '"$caddy_fragment_usr_lib_path")"',
+            'caddy_fragment_sha_record="$(/usr/bin/sha256sum '
+            '"$resolved_caddy_fragment")"',
+            'caddy_fragment_lib_sha_record="$(/usr/bin/sha256sum '
+            '"$caddy_fragment_lib_path")"',
+            'caddy_fragment_usr_lib_sha_record="$(/usr/bin/sha256sum '
+            '"$caddy_fragment_usr_lib_path")"',
+        ):
+            self.assertIn(record, readonly_section)
+        self.assertGreaterEqual(
+            readonly_section.count("=~ ^[0-9]+:[0-9]+$"), 3
+        )
+        self.assertIn(
+            'test "$resolved_caddy_fragment" = '
+            '"$resolved_caddy_fragment_lib"',
+            readonly_section,
+        )
+        self.assertIn(
+            'test "$resolved_caddy_fragment" = '
+            '"$resolved_caddy_fragment_usr_lib"',
+            readonly_section,
+        )
+        self.assertIn(
+            'test "$caddy_fragment_identity" = '
+            '"$caddy_fragment_lib_identity"',
+            readonly_section,
+        )
+        self.assertIn(
+            'test "$caddy_fragment_identity" = '
+            '"$caddy_fragment_usr_lib_identity"',
+            readonly_section,
+        )
+        self.assertIn(
+            'test "$caddy_fragment_sha256" = '
+            '"$caddy_fragment_lib_sha256"',
+            readonly_section,
+        )
+        self.assertIn(
+            'test "$caddy_fragment_sha256" = '
+            '"$caddy_fragment_usr_lib_sha256"',
+            readonly_section,
+        )
+        self.assertIn(
+            '/usr/bin/dpkg-query -S "$caddy_fragment_package_path"',
+            readonly_section,
+        )
+        self.assertIn(
+            'test "$caddy_fragment_package_status" -eq 1', readonly_section
+        )
+        self.assertNotIn(
+            '/usr/bin/dpkg-query -S "$caddy_fragment_path"', readonly_section
+        )
+        equivalence = readonly_section.index(
+            "caddy_unit_fragment_aliases=equivalent"
+        )
+        package_lookup = readonly_section.index(
+            '/usr/bin/dpkg-query -S "$caddy_fragment_package_path"'
+        )
+        approved = readonly_section.index(
+            "caddy_unit_fragment=approved sha256="
+        )
+        self.assertLess(equivalence, package_lookup)
+        self.assertLess(package_lookup, approved)
 
     def test_release_is_pinned_to_the_verified_remote_tip_and_checked_out_detached(self) -> None:
         plan = self.read("README.md")
