@@ -171,7 +171,7 @@ Shared Diary 回归和回滚细节见
      printf '%s\n' 'eryu_release_gate=failed' >&2
      exit 1
    }
-   readonly ERYU_REPOSITORY='https://github.com/sebastianevan200-stack/eryu'
+   readonly ERYU_REPOSITORY='https://github.com/anqicheng806-hub/eryu'
    readonly ERYU_BRANCH='feature/music-presence-mcp'
    test "$(command -v git)" = /usr/bin/git || release_gate_failed
    test -x /usr/bin/git || release_gate_failed
