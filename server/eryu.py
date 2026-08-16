@@ -88,6 +88,7 @@ logger = logging.getLogger("eryu")
 # ── Secret management ────────────────────────────────────────────────────────
 
 MAX_JSON_BODY_BYTES = 64 * 1024
+MAX_JSON_NESTING_DEPTH = 64
 MAX_SPECTROGRAM_BYTES = 8 * 1024 * 1024
 ANALYZER_ENV_ALLOWLIST = frozenset(
     {
@@ -150,6 +151,29 @@ class RequestBodyError(ValueError):
         self.status = status
         self.message = message
         self.close_connection = close_connection
+
+
+def _json_nesting_exceeds_limit(value: Any) -> bool:
+    """Check parsed container depth without relying on Python recursion limits."""
+
+    stack = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > MAX_JSON_NESTING_DEPTH:
+            return True
+        if isinstance(current, dict):
+            children = current.values()
+        elif isinstance(current, list):
+            children = current
+        else:
+            continue
+        child_depth = depth + 1
+        stack.extend(
+            (child, child_depth)
+            for child in children
+            if isinstance(child, (dict, list))
+        )
+    return False
 
 
 def _parse_server_host(value: str | None) -> str:
@@ -344,6 +368,8 @@ class EryuHandler(BaseHTTPRequestHandler):
             raise RequestBodyError(400, "invalid JSON body") from exc
         if not isinstance(body, dict):
             raise RequestBodyError(400, "JSON body must be an object")
+        if _json_nesting_exceeds_limit(body):
+            raise RequestBodyError(400, "invalid JSON body")
         return body
 
     def _mcp_read_route_allowed(self, path: str) -> bool:

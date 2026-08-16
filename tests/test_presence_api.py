@@ -17,6 +17,7 @@ from unittest import mock
 
 from server.eryu import (
     EryuHandler,
+    MAX_JSON_NESTING_DEPTH,
     ServerState,
     ThreadingHTTPServer,
     _parse_allowed_origin,
@@ -468,6 +469,66 @@ class PresenceApiTest(unittest.TestCase):
             self.assertEqual(response.getheader("Cache-Control"), "no-store")
         finally:
             connection.close()
+
+        self.assertEqual(MAX_JSON_NESTING_DEPTH, 64)
+        at_limit_objects = (
+            '{"a":' * MAX_JSON_NESTING_DEPTH
+            + "0"
+            + "}" * MAX_JSON_NESTING_DEPTH
+        ).encode("utf-8")
+        at_limit_arrays = (
+            b'{"a":'
+            + b"[" * (MAX_JSON_NESTING_DEPTH - 1)
+            + b"0"
+            + b"]" * (MAX_JSON_NESTING_DEPTH - 1)
+            + b"}"
+        )
+        quoted_delimiters = json.dumps(
+            {"a": '\\"{}[]' * (MAX_JSON_NESTING_DEPTH + 1)}
+        ).encode("utf-8")
+        utf16_delimiters = json.dumps(
+            {"a": '\\"{}[]' * (MAX_JSON_NESTING_DEPTH + 1)}
+        ).encode("utf-16")
+        for raw_body in (
+            at_limit_objects,
+            at_limit_arrays,
+            quoted_delimiters,
+            utf16_delimiters,
+        ):
+            with self.subTest(boundary="allowed", raw_body=raw_body[:32]):
+                status, _, body = self.request(
+                    "POST",
+                    "/music/presence",
+                    token=FULL_TOKEN,
+                    raw_body=raw_body,
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(
+                    body, {"ok": False, "error": "invalid presence payload"}
+                )
+
+        too_deep_objects = (
+            '{"a":' * (MAX_JSON_NESTING_DEPTH + 1)
+            + "0"
+            + "}" * (MAX_JSON_NESTING_DEPTH + 1)
+        ).encode("utf-8")
+        too_deep_arrays = (
+            b'{"a":'
+            + b"[" * MAX_JSON_NESTING_DEPTH
+            + b"0"
+            + b"]" * MAX_JSON_NESTING_DEPTH
+            + b"}"
+        )
+        for raw_body in (too_deep_objects, too_deep_arrays):
+            with self.subTest(boundary="rejected", raw_body=raw_body[:32]):
+                status, _, body = self.request(
+                    "POST",
+                    "/music/presence",
+                    token=FULL_TOKEN,
+                    raw_body=raw_body,
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(body, {"error": "invalid JSON body"})
 
         deeply_nested = ('{"a":' * 5000 + "0" + "}" * 5000).encode("utf-8")
         status, _, body = self.request(
