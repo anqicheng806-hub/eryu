@@ -128,20 +128,52 @@ def _validate_reported_at(value: Any) -> str:
     return reported_at
 
 
-def _validate_song(value: Any) -> dict[str, Any] | None:
+def _validate_catalog(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    catalog = _expect_mapping(value, "song.catalog")
+    _expect_exact_keys(catalog, {"provider", "songId"}, "song.catalog")
+    provider = _expect_string(
+        catalog["provider"],
+        "song.catalog.provider",
+        16,
+        allow_empty=False,
+    )
+    if provider != "netease":
+        raise PresenceValidationError("song.catalog.provider must be netease")
+    song_id = catalog["songId"]
+    if (
+        not isinstance(song_id, str)
+        or not _SONG_ID_PATTERN.fullmatch(song_id)
+        or int(song_id) <= 0
+        or str(int(song_id)) != song_id
+    ):
+        raise PresenceValidationError(
+            "song.catalog.songId must be a positive numeric string"
+        )
+    return {"provider": provider, "songId": song_id}
+
+
+def _validate_song(value: Any, schema_version: int) -> dict[str, Any] | None:
     if value is None:
         return None
     song = _expect_mapping(value, "song")
-    _expect_exact_keys(song, {"songId", "name", "artist", "album", "cover"}, "song")
+    expected_fields = {"songId", "name", "artist", "album", "cover"}
+    if schema_version == 2:
+        expected_fields.add("catalog")
+    _expect_exact_keys(song, expected_fields, "song")
     if not is_valid_song_id(song["songId"]):
         raise PresenceValidationError("song.songId must be a positive numeric id")
-    return {
+    normalized = {
         "songId": str(song["songId"]),
         "name": _expect_string(song["name"], "song.name", MAX_TEXT_LENGTH),
         "artist": _expect_string(song["artist"], "song.artist", MAX_TEXT_LENGTH),
         "album": _expect_string(song["album"], "song.album", MAX_TEXT_LENGTH),
         "cover": _expect_string(song["cover"], "song.cover", MAX_URL_LENGTH),
     }
+    if schema_version == 2:
+        normalized["catalog"] = _validate_catalog(song["catalog"])
+    return normalized
 
 
 def _validate_playback(value: Any) -> dict[str, Any]:
@@ -249,8 +281,12 @@ def validate_presence_payload(value: Any) -> dict[str, Any]:
         "presence",
     )
     schema_version = payload["schemaVersion"]
-    if isinstance(schema_version, bool) or schema_version != 1:
-        raise PresenceValidationError("schemaVersion must be 1")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version not in {1, 2}
+    ):
+        raise PresenceValidationError("schemaVersion must be 1 or 2")
     client_session_id = _expect_string(
         payload["clientSessionId"],
         "clientSessionId",
@@ -259,9 +295,9 @@ def validate_presence_payload(value: Any) -> dict[str, Any]:
     )
     if not _SESSION_ID_PATTERN.fullmatch(client_session_id):
         raise PresenceValidationError("clientSessionId contains unsupported characters")
-    song = _validate_song(payload["song"])
+    song = _validate_song(payload["song"], schema_version)
     return {
-        "schemaVersion": 1,
+        "schemaVersion": schema_version,
         "clientSessionId": client_session_id,
         "sequence": _expect_integer(payload["sequence"], "sequence"),
         "reportedAt": _validate_reported_at(payload["reportedAt"]),

@@ -123,6 +123,27 @@ def playing_presence_for_song(
     return payload
 
 
+def playing_presence_v2(
+    public_song_id: int,
+    catalog_song_id: str | None,
+    *,
+    session_id: str = "test-current-song-v2",
+    sequence: int = 1,
+) -> dict:
+    payload = playing_presence_for_song(
+        public_song_id,
+        session_id=session_id,
+        sequence=sequence,
+    )
+    payload["schemaVersion"] = 2
+    payload["song"]["catalog"] = (
+        None
+        if catalog_song_id is None
+        else {"provider": "netease", "songId": catalog_song_id}
+    )
+    return payload
+
+
 class PresenceApiTest(unittest.TestCase):
     def setUp(self) -> None:
         self.environment = mock.patch.dict(
@@ -268,6 +289,66 @@ class PresenceApiTest(unittest.TestCase):
         self.assertEqual(body["presence"]["lyrics"]["currentIndex"], -1)
         self.assertIsNone(body["presence"]["lyrics"]["current"])
 
+    def test_presence_v2_requires_and_normalizes_catalog_without_changing_v1(self) -> None:
+        v1 = validate_presence_payload(playing_presence())
+        self.assertEqual(v1["schemaVersion"], 1)
+        self.assertNotIn("catalog", v1["song"])
+
+        for catalog_song_id in ("789", None):
+            with self.subTest(catalog_song_id=catalog_song_id):
+                normalized = validate_presence_payload(
+                    playing_presence_v2(123, catalog_song_id)
+                )
+                self.assertEqual(normalized["schemaVersion"], 2)
+                self.assertEqual(normalized["song"]["songId"], "123")
+                expected = (
+                    None
+                    if catalog_song_id is None
+                    else {"provider": "netease", "songId": catalog_song_id}
+                )
+                self.assertEqual(normalized["song"]["catalog"], expected)
+
+        idle_v2 = idle_presence()
+        idle_v2["schemaVersion"] = 2
+        self.assertIsNone(validate_presence_payload(idle_v2)["song"])
+
+    def test_presence_versions_reject_cross_version_or_invalid_catalog_shapes(self) -> None:
+        invalid_payloads = []
+
+        v1_with_catalog = playing_presence()
+        v1_with_catalog["song"]["catalog"] = None
+        invalid_payloads.append(v1_with_catalog)
+
+        v2_without_catalog = playing_presence()
+        v2_without_catalog["schemaVersion"] = 2
+        invalid_payloads.append(v2_without_catalog)
+
+        for catalog in (
+            {},
+            {"provider": "spotify", "songId": "789"},
+            {"provider": "netease", "songId": 789},
+            {"provider": "netease", "songId": "0"},
+            {"provider": "netease", "songId": "00789"},
+            {"provider": "netease", "songId": "../789"},
+            {"provider": "netease", "songId": "789", "extra": True},
+        ):
+            payload = playing_presence_v2(123, None)
+            payload["song"]["catalog"] = catalog
+            invalid_payloads.append(payload)
+
+        unsupported_version = playing_presence()
+        unsupported_version["schemaVersion"] = 3
+        invalid_payloads.append(unsupported_version)
+
+        non_integer_version = playing_presence()
+        non_integer_version["schemaVersion"] = 2.0
+        invalid_payloads.append(non_integer_version)
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(PresenceValidationError):
+                    validate_presence_payload(payload)
+
     def test_sequence_must_increase_per_session_without_refreshing_rejections(self) -> None:
         initial = playing_presence()
         self.assertEqual(
@@ -385,6 +466,175 @@ class PresenceApiTest(unittest.TestCase):
         ):
             with self.subTest(path=path, state="stale"):
                 self.assertEqual(self.request("GET", path, token=READ_TOKEN)[0], 403)
+
+    def test_v2_mcp_analysis_uses_catalog_cache_and_rebinds_public_song_id(self) -> None:
+        cache_dir = self.state.data_dir / "music_cache"
+        provider_song_id = "789"
+        public_song_id = 123
+        (cache_dir / f"{provider_song_id}_preanalysis.json").write_text(
+            json.dumps(
+                {
+                    "songId": provider_song_id,
+                    "name": "Mapped Song",
+                    "artist": "Mapped Artist",
+                    "duration": 180,
+                    "bpm": 128,
+                    "key": "C#",
+                    "segments": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        image = b"\x89PNG\r\n\x1a\nmapped-image"
+        (cache_dir / f"{provider_song_id}_analysis.png").write_bytes(image)
+        self.assertEqual(
+            self.request(
+                "POST",
+                "/music/presence",
+                token=FULL_TOKEN,
+                payload=playing_presence_v2(public_song_id, provider_song_id),
+            )[0],
+            200,
+        )
+
+        status, _, body = self.request(
+            "GET",
+            f"/music/analyze/status?id={public_song_id}",
+            token=READ_TOKEN,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "ready")
+        self.assertEqual(body["analysis"]["songId"], str(public_song_id))
+        self.assertTrue(body["analysis"]["spectrogramAvailable"])
+        self.assertNotIn(provider_song_id, json.dumps(body))
+
+        status, _, response_image = self.request_bytes(
+            "GET",
+            f"/music/analyze/spectrogram?id={public_song_id}",
+            token=READ_TOKEN,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response_image, image)
+
+        full_status = self.request(
+            "GET",
+            f"/music/analyze/status?id={provider_song_id}",
+            token=FULL_TOKEN,
+        )[2]
+        self.assertEqual(full_status["status"], "ready")
+        self.assertEqual(full_status["analysis"]["songId"], provider_song_id)
+        self.assertEqual(
+            self.request(
+                "GET",
+                f"/music/analyze/status?id={public_song_id}",
+                token=FULL_TOKEN,
+            )[2],
+            {"ok": True, "status": "none"},
+        )
+
+    def test_v2_null_catalog_hides_public_id_analysis_from_mcp_read(self) -> None:
+        cache_dir = self.state.data_dir / "music_cache"
+        public_song_id = "123"
+        (cache_dir / f"{public_song_id}_preanalysis.json").write_text(
+            json.dumps({"songId": public_song_id, "segments": []}),
+            encoding="utf-8",
+        )
+        image = b"\x89PNG\r\n\x1a\npublic-id-image"
+        (cache_dir / f"{public_song_id}_analysis.png").write_bytes(image)
+        self.assertEqual(
+            self.request(
+                "POST",
+                "/music/presence",
+                token=FULL_TOKEN,
+                payload=playing_presence_v2(int(public_song_id), None),
+            )[0],
+            200,
+        )
+
+        self.assertEqual(
+            self.request(
+                "GET",
+                f"/music/analyze/status?id={public_song_id}",
+                token=READ_TOKEN,
+            )[2],
+            {"ok": True, "status": "none"},
+        )
+        status, _, body = self.request(
+            "GET",
+            f"/music/analyze/spectrogram?id={public_song_id}",
+            token=READ_TOKEN,
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(body, {"error": "spectrogram not found"})
+
+        self.assertEqual(
+            self.request(
+                "GET",
+                f"/music/analyze/status?id={public_song_id}",
+                token=FULL_TOKEN,
+            )[2]["status"],
+            "ready",
+        )
+        self.assertEqual(
+            self.request_bytes(
+                "GET",
+                f"/music/analyze/spectrogram?id={public_song_id}",
+                token=FULL_TOKEN,
+            )[2],
+            image,
+        )
+
+    def test_analysis_result_song_id_must_match_the_resolved_cache_id(self) -> None:
+        cache_dir = self.state.data_dir / "music_cache"
+        (cache_dir / "789_preanalysis.json").write_text(
+            json.dumps({"songId": "790", "bpm": 120, "segments": []}),
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            self.request(
+                "POST",
+                "/music/presence",
+                token=FULL_TOKEN,
+                payload=playing_presence_v2(123, "789"),
+            )[0],
+            200,
+        )
+
+        for token, request_song_id in ((READ_TOKEN, "123"), (FULL_TOKEN, "789")):
+            with self.subTest(token=token, request_song_id=request_song_id):
+                status, _, body = self.request(
+                    "GET",
+                    f"/music/analyze/status?id={request_song_id}",
+                    token=token,
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(body, {"ok": True, "status": "error"})
+                self.assertNotIn("790", json.dumps(body))
+
+    def test_mcp_analysis_rechecks_fresh_current_song_after_auth(self) -> None:
+        self.state.presence.update(
+            playing_presence_v2(123, "789", session_id="race-old")
+        )
+        old_current = self.state.presence.read()
+        self.state.presence.update(
+            playing_presence_v2(124, "790", session_id="race-new")
+        )
+        new_current = self.state.presence.read()
+
+        for path in (
+            "/music/analyze/status?id=123",
+            "/music/analyze/spectrogram?id=123",
+        ):
+            with self.subTest(path=path):
+                with mock.patch.object(
+                    self.state.presence,
+                    "read",
+                    side_effect=[old_current, new_current],
+                ) as read:
+                    status, _, body = self.request("GET", path, token=READ_TOKEN)
+                self.assertEqual(read.call_count, 2)
+                self.assertEqual(status, 403)
+                self.assertEqual(body, {"error": "auth required"})
 
     def test_invalid_presence_payloads_are_rejected(self) -> None:
         cases = []
@@ -583,6 +833,83 @@ class PresenceApiTest(unittest.TestCase):
                 self.assertEqual(status, 404)
                 self.assertEqual(body, {"error": "not found"})
 
+    def test_music_search_adds_safely_converted_duration_seconds(self) -> None:
+        raw_songs = [
+            {
+                "id": 1,
+                "name": "Valid",
+                "artists": [{"name": "Artist"}],
+                "album": {"name": "Album"},
+                "duration": 123456,
+            },
+            {
+                "id": 2,
+                "name": "Missing",
+                "artists": [],
+                "album": {},
+            },
+            {
+                "id": 3,
+                "name": "String",
+                "artists": [],
+                "album": {},
+                "duration": "123456",
+            },
+            {
+                "id": 4,
+                "name": "Negative",
+                "artists": [],
+                "album": {},
+                "duration": -1,
+            },
+            {
+                "id": 5,
+                "name": "Nonfinite",
+                "artists": [],
+                "album": {},
+                "duration": math.inf,
+            },
+            {
+                "id": 6,
+                "name": "Boolean",
+                "artists": [],
+                "album": {},
+                "duration": True,
+            },
+        ]
+
+        def fake_netease_request(
+            handler,
+            url: str,
+            data: bytes | None = None,
+            extra_headers: dict[str, str] | None = None,
+            timeout: int = 10,
+        ) -> dict:
+            del handler, data, extra_headers, timeout
+            if "/api/search/get" in url:
+                return {"result": {"songs": raw_songs}}
+            if "/api/song/detail" in url:
+                return {"songs": []}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with mock.patch.object(
+            EryuHandler,
+            "_netease_request",
+            new=fake_netease_request,
+        ):
+            status, _, body = self.request(
+                "GET",
+                "/music/search?q=duration",
+                token=FULL_TOKEN,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(
+            [song["durationSeconds"] for song in body["songs"]],
+            [123.456, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+
     def test_analysis_id_and_response_are_sanitized(self) -> None:
         cache_dir = self.state.data_dir / "music_cache"
         result_path = cache_dir / "123_preanalysis.json"
@@ -674,6 +1001,10 @@ class PresenceApiTest(unittest.TestCase):
     def test_spectrogram_is_authenticated_current_song_png_without_path_leak(self) -> None:
         cache_dir = self.state.data_dir / "music_cache"
         image = b"\x89PNG\r\n\x1a\nsynthetic-test-image"
+        (cache_dir / "123_preanalysis.json").write_text(
+            json.dumps({"songId": "123", "segments": []}),
+            encoding="utf-8",
+        )
         (cache_dir / "123_analysis.png").write_bytes(image)
         self.assertEqual(
             self.request(
@@ -718,6 +1049,45 @@ class PresenceApiTest(unittest.TestCase):
             )[0],
             413,
         )
+
+    def test_spectrogram_requires_a_result_with_the_exact_cache_song_id(self) -> None:
+        cache_dir = self.state.data_dir / "music_cache"
+        (cache_dir / "789_analysis.png").write_bytes(
+            b"\x89PNG\r\n\x1a\norphan-image"
+        )
+        self.assertEqual(
+            self.request(
+                "POST",
+                "/music/presence",
+                token=FULL_TOKEN,
+                payload=playing_presence_v2(123, "789"),
+            )[0],
+            200,
+        )
+
+        for token, request_song_id in ((READ_TOKEN, "123"), (FULL_TOKEN, "789")):
+            with self.subTest(token=token, state="orphan"):
+                status, _, body = self.request(
+                    "GET",
+                    f"/music/analyze/spectrogram?id={request_song_id}",
+                    token=token,
+                )
+                self.assertEqual(status, 404)
+                self.assertEqual(body, {"error": "spectrogram not found"})
+
+        (cache_dir / "789_preanalysis.json").write_text(
+            json.dumps({"songId": "790", "segments": []}),
+            encoding="utf-8",
+        )
+        for token, request_song_id in ((READ_TOKEN, "123"), (FULL_TOKEN, "789")):
+            with self.subTest(token=token, state="mismatch"):
+                status, _, body = self.request(
+                    "GET",
+                    f"/music/analyze/spectrogram?id={request_song_id}",
+                    token=token,
+                )
+                self.assertEqual(status, 404)
+                self.assertEqual(body, {"error": "spectrogram not found"})
 
 
 class PresenceConfigurationTest(unittest.TestCase):

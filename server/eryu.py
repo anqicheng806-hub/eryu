@@ -281,6 +281,18 @@ def _safe_analysis_number(value: Any) -> float | int | None:
     return value
 
 
+def _duration_seconds_from_milliseconds(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    try:
+        milliseconds = float(value)
+    except (OverflowError, ValueError):
+        return 0.0
+    if not math.isfinite(milliseconds) or milliseconds < 0:
+        return 0.0
+    return round(milliseconds / 1000.0, 3)
+
+
 def _sanitize_analysis_result(
     result: Any, song_id: str, *, spectrogram_available: bool
 ) -> dict[str, Any] | None:
@@ -392,6 +404,37 @@ class EryuHandler(BaseHTTPRequestHandler):
         return isinstance(song, dict) and hmac.compare_digest(
             str(song.get("songId", "")), str(song_ids[0])
         )
+
+    def _resolve_mcp_analysis_cache_song_id(
+        self, public_song_id: str
+    ) -> tuple[bool, str | None]:
+        """Recheck current presence and resolve its private analysis cache key."""
+
+        current = self.state.presence.read()
+        if current.get("freshness", {}).get("state") != "fresh":
+            return False, None
+        presence = current.get("presence")
+        if not isinstance(presence, dict):
+            return False, None
+        song = presence.get("song")
+        if not isinstance(song, dict) or not hmac.compare_digest(
+            str(song.get("songId", "")), public_song_id
+        ):
+            return False, None
+        if presence.get("schemaVersion") != 2:
+            return True, public_song_id
+        catalog = song.get("catalog")
+        if catalog is None:
+            return True, None
+        if (
+            not isinstance(catalog, dict)
+            or catalog.get("provider") != "netease"
+            or not isinstance(catalog.get("songId"), str)
+            or not is_valid_song_id(catalog["songId"])
+            or str(int(catalog["songId"])) != catalog["songId"]
+        ):
+            return False, None
+        return True, catalog["songId"]
 
     def _check_auth(self, path: str, method: str) -> str | None:
         token = self.headers.get("X-Auth-Token", "")
@@ -851,6 +894,9 @@ class EryuHandler(BaseHTTPRequestHandler):
                     "artist": artists,
                     "album": album.get("name", ""),
                     "cover": cover,
+                    "durationSeconds": _duration_seconds_from_milliseconds(
+                        s.get("duration")
+                    ),
                 })
             self._send_json(200, {"ok": True, "songs": songs})
         except Exception as e:
@@ -1339,32 +1385,52 @@ class EryuHandler(BaseHTTPRequestHandler):
         if len(song_ids) != 1 or not is_valid_song_id(song_ids[0]):
             self._send_json(400, {"error": "id must be a positive numeric id"})
             return
-        song_id = str(song_ids[0])
+        public_song_id = str(song_ids[0])
+        cache_song_id = public_song_id
+        if getattr(self, "auth_role", None) == "mcp_read":
+            allowed, resolved_song_id = self._resolve_mcp_analysis_cache_song_id(
+                public_song_id
+            )
+            if not allowed:
+                self._send_json(403, {"error": "auth required"})
+                return
+            if resolved_song_id is None:
+                self._send_json(200, {"ok": True, "status": "none"})
+                return
+            cache_song_id = resolved_song_id
         cache_dir = self.state.data_dir / "music_cache"
-        result_file = cache_dir / f"{song_id}_preanalysis.json"
+        result_file = cache_dir / f"{cache_song_id}_preanalysis.json"
         if result_file.exists():
             try:
                 result = json.loads(result_file.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 self._send_json(200, {"ok": True, "status": "error"})
                 return
+            stored_song_id = result.get("songId") if isinstance(result, dict) else None
+            if not isinstance(stored_song_id, str) or not hmac.compare_digest(
+                stored_song_id, cache_song_id
+            ):
+                self._send_json(200, {"ok": True, "status": "error"})
+                return
             analysis = _sanitize_analysis_result(
                 result,
-                song_id,
-                spectrogram_available=(cache_dir / f"{song_id}_analysis.png").is_file(),
+                public_song_id,
+                spectrogram_available=(
+                    cache_dir / f"{cache_song_id}_analysis.png"
+                ).is_file(),
             )
             if analysis is None:
                 self._send_json(200, {"ok": True, "status": "error"})
                 return
             self._send_json(200, {"ok": True, "status": "ready", "analysis": analysis})
             return
-        marker_file = cache_dir / f"{song_id}.analyzing"
+        marker_file = cache_dir / f"{cache_song_id}.analyzing"
         if marker_file.exists():
             age = time.time() - marker_file.stat().st_mtime
             if age < 60:
                 self._send_json(200, {"ok": True, "status": "running"})
                 return
-        err_file = cache_dir / f"{song_id}_analyze_error.txt"
+        err_file = cache_dir / f"{cache_song_id}_analyze_error.txt"
         if err_file.exists():
             self._send_json(200, {"ok": True, "status": "error"})
             return
@@ -1376,8 +1442,33 @@ class EryuHandler(BaseHTTPRequestHandler):
         if set(qs) != {"id"} or len(song_ids) != 1 or not is_valid_song_id(song_ids[0]):
             self._send_json(400, {"error": "id must be a positive numeric id"})
             return
-        song_id = str(song_ids[0])
-        image_file = self.state.data_dir / "music_cache" / f"{song_id}_analysis.png"
+        public_song_id = str(song_ids[0])
+        cache_song_id = public_song_id
+        if getattr(self, "auth_role", None) == "mcp_read":
+            allowed, resolved_song_id = self._resolve_mcp_analysis_cache_song_id(
+                public_song_id
+            )
+            if not allowed:
+                self._send_json(403, {"error": "auth required"})
+                return
+            if resolved_song_id is None:
+                self._send_json(404, {"error": "spectrogram not found"})
+                return
+            cache_song_id = resolved_song_id
+        cache_dir = self.state.data_dir / "music_cache"
+        result_file = cache_dir / f"{cache_song_id}_preanalysis.json"
+        try:
+            result = json.loads(result_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(404, {"error": "spectrogram not found"})
+            return
+        stored_song_id = result.get("songId") if isinstance(result, dict) else None
+        if not isinstance(stored_song_id, str) or not hmac.compare_digest(
+            stored_song_id, cache_song_id
+        ):
+            self._send_json(404, {"error": "spectrogram not found"})
+            return
+        image_file = cache_dir / f"{cache_song_id}_analysis.png"
         try:
             size = image_file.stat().st_size
         except OSError:

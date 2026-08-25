@@ -31,6 +31,8 @@ HTTP_TIMEOUT_SECONDS = 3.0
 MAX_RESPONSE_BYTES = 1_048_576
 MAX_IMAGE_BYTES = 8 * 1_048_576
 SONG_ID_RE = re.compile(r"^[0-9]{1,20}$")
+CLIENT_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+MAX_PRESENCE_SEQUENCE = 2**53 - 1
 ALLOWED_PATHS = frozenset(
     {
         "/music/presence",
@@ -66,6 +68,9 @@ class ReadClient(Protocol):
         path: str,
         query: Mapping[str, str] | None = None,
     ) -> bytes: ...
+
+
+PresenceRevision = tuple[str, int, str, str]
 
 
 class EryuReadClient:
@@ -455,7 +460,47 @@ def _normalize_presence(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _current_presence(client: ReadClient) -> dict[str, Any]:
+def _presence_revision(
+    payload: Mapping[str, Any],
+    normalized: Mapping[str, Any],
+) -> PresenceRevision | None:
+    """Extract an internal-only identity for one exact fresh presence snapshot."""
+
+    if normalized.get("available") is not True:
+        return None
+    raw_presence = payload.get("presence")
+    raw_freshness = payload.get("freshness")
+    song = normalized.get("song")
+    if (
+        not isinstance(raw_presence, Mapping)
+        or not isinstance(raw_freshness, Mapping)
+        or not isinstance(song, Mapping)
+    ):
+        return None
+
+    client_session_id = raw_presence.get("clientSessionId")
+    sequence = raw_presence.get("sequence")
+    received_at = raw_freshness.get("receivedAt")
+    public_song_id = _song_id(song.get("songId"))
+    if (
+        not isinstance(client_session_id, str)
+        or CLIENT_SESSION_ID_RE.fullmatch(client_session_id) is None
+        or not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or sequence < 0
+        or sequence > MAX_PRESENCE_SEQUENCE
+        or not isinstance(received_at, str)
+        or not received_at
+        or len(received_at) > 100
+        or public_song_id is None
+    ):
+        return None
+    return client_session_id, sequence, received_at, public_song_id
+
+
+async def _current_presence_with_revision(
+    client: ReadClient,
+) -> tuple[dict[str, Any], PresenceRevision | None]:
     try:
         payload = await client.get_json("/music/presence")
     except Exception:
@@ -464,15 +509,21 @@ async def _current_presence(client: ReadClient) -> dict[str, Any]:
             "available": False,
             "state": "unavailable",
             "reason": "presence_unavailable",
-        }
+        }, None
     if not isinstance(payload, Mapping):
         return {
             "ok": False,
             "available": False,
             "state": "unavailable",
             "reason": "presence_unavailable",
-        }
-    return _normalize_presence(payload)
+        }, None
+    normalized = _normalize_presence(payload)
+    return normalized, _presence_revision(payload, normalized)
+
+
+async def _current_presence(client: ReadClient) -> dict[str, Any]:
+    presence, _revision = await _current_presence_with_revision(client)
+    return presence
 
 
 def _sanitize_segments(value: Any) -> list[dict[str, float]]:
@@ -582,6 +633,37 @@ def _analysis_result(
     return CallToolResult(content=content, structured_content=structured)
 
 
+def _analysis_current_changed() -> CallToolResult:
+    return _analysis_result(
+        {
+            "ok": True,
+            "available": False,
+            "state": "current_changed",
+            "reason": "analysis_current_changed",
+        }
+    )
+
+
+def _analysis_unavailable(presence: Mapping[str, Any]) -> CallToolResult:
+    return _analysis_result(
+        {
+            "ok": False,
+            "available": False,
+            "state": "unavailable",
+            "reason": "analysis_unavailable",
+            "song": presence["song"],
+        }
+    )
+
+
+async def _analysis_revision_is_current(
+    client: ReadClient,
+    expected: PresenceRevision,
+) -> bool:
+    current, revision = await _current_presence_with_revision(client)
+    return current.get("available") is True and revision == expected
+
+
 def build_server(
     client: ReadClient | None = None,
     *,
@@ -661,28 +743,25 @@ def build_server(
         meta=_oauth_security_meta(auth is not None),
     )
     async def music_analysis() -> CallToolResult:
-        presence = await _current_presence(read_client)
+        presence, revision = await _current_presence_with_revision(read_client)
         if not presence.get("available"):
             return _analysis_result(presence)
+        if revision is None:
+            return _analysis_unavailable(presence)
         sid = presence["song"]["songId"]
+        payload: Any = None
+        status_failed = False
         try:
             payload = await read_client.get_json("/music/analyze/status", {"id": sid})
         except Exception:
-            return _analysis_result({
-                "ok": False,
-                "available": False,
-                "state": "unavailable",
-                "reason": "analysis_unavailable",
-                "song": presence["song"],
-            })
+            status_failed = True
+
+        if not await _analysis_revision_is_current(read_client, revision):
+            return _analysis_current_changed()
+        if status_failed:
+            return _analysis_unavailable(presence)
         if not isinstance(payload, Mapping) or payload.get("ok") is not True:
-            return _analysis_result({
-                "ok": False,
-                "available": False,
-                "state": "unavailable",
-                "reason": "analysis_unavailable",
-                "song": presence["song"],
-            })
+            return _analysis_unavailable(presence)
 
         raw_status = payload.get("status")
         status = raw_status if raw_status in {"ready", "running", "none"} else "error" if isinstance(raw_status, str) and raw_status.startswith("error") else "unavailable"
@@ -697,15 +776,9 @@ def build_server(
 
         raw_analysis = payload.get("analysis")
         if not isinstance(raw_analysis, Mapping):
-            return _analysis_result({
-                "ok": False,
-                "available": False,
-                "state": "unavailable",
-                "reason": "analysis_unavailable",
-                "song": presence["song"],
-            })
+            return _analysis_unavailable(presence)
         analysis_song_id = raw_analysis.get("songId")
-        if analysis_song_id is not None and _song_id(analysis_song_id) != sid:
+        if analysis_song_id != sid:
             return _analysis_result({
                 "ok": False,
                 "available": False,
@@ -741,6 +814,8 @@ def build_server(
                 )
             except Exception:
                 spectrogram = None
+            if not await _analysis_revision_is_current(read_client, revision):
+                return _analysis_current_changed()
         analysis["spectrogramIncluded"] = spectrogram is not None
         result = {
             "ok": True,

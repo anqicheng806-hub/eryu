@@ -57,6 +57,9 @@ All protected endpoints require the `X-Auth-Token` header. Query-string tokens a
 - `POST /music/presence` — Web player heartbeat (full token only)
 - `GET /music/presence` — Last snapshot with explicit `absent`, `fresh`, or `stale` freshness
 
+Windows desktop players that expose GSMTC can use the independent
+[Windows Reader](docs/windows-reader.md) without changing this API.
+
 ### Playback
 - `GET /music/search?q=keyword` — Search songs
 - `GET /music/url?id=songId` — Get audio URL (auto-caches)

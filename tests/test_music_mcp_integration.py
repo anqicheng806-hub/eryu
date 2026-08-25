@@ -16,6 +16,7 @@ from server.eryu import EryuHandler, ServerState, ThreadingHTTPServer
 
 FULL_TOKEN = "integration-full-token-for-tests-000001"
 READ_TOKEN = "integration-read-token-for-tests-000002"
+SYNTHETIC_SONG_ID = "987654321012345678"
 
 
 def current_presence() -> dict:
@@ -47,6 +48,19 @@ def current_presence() -> dict:
             "next": [],
         },
     }
+
+
+def mapped_reader_presence() -> dict:
+    presence = current_presence()
+    presence["schemaVersion"] = 2
+    presence["sequence"] = 2
+    presence["song"]["songId"] = SYNTHETIC_SONG_ID
+    presence["song"]["catalog"] = {
+        "provider": "netease",
+        "songId": "12345",
+    }
+    presence["lyrics"]["songId"] = SYNTHETIC_SONG_ID
+    return presence
 
 
 class MusicMcpHttpIntegrationTest(unittest.IsolatedAsyncioTestCase):
@@ -120,6 +134,40 @@ class MusicMcpHttpIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.type for item in result.content], ["text", "image"])
         self.assertEqual(result.content[1].mime_type, "image/png")
         self.assertNotIn("C:/private", json.dumps(result.structured_content))
+
+    async def test_reader_catalog_mapping_rebinds_existing_analysis_to_synthetic_id(
+        self,
+    ) -> None:
+        self.state.presence.update(mapped_reader_presence())
+        backend = EryuReadClient(
+            f"http://127.0.0.1:{self.http_server.server_port}",
+            READ_TOKEN,
+        )
+
+        async with Client(build_server(backend), raise_exceptions=True) as client:
+            result = await client.call_tool("music_analysis", {})
+
+        self.assertFalse(result.is_error)
+        self.assertTrue(result.structured_content["available"])
+        self.assertEqual(
+            result.structured_content["song"]["songId"], SYNTHETIC_SONG_ID
+        )
+        self.assertEqual(
+            result.structured_content["analysis"]["songId"], SYNTHETIC_SONG_ID
+        )
+        self.assertEqual(result.structured_content["analysis"]["bpm"], 128.0)
+        self.assertTrue(result.structured_content["analysis"]["spectrogramIncluded"])
+        serialized = json.dumps(result.structured_content, separators=(",", ":"))
+        self.assertNotIn('"catalog"', serialized)
+        self.assertNotIn('"songId":"12345"', serialized)
+        self.assertNotIn("C:/private", serialized)
+        for content in result.content:
+            text = getattr(content, "text", None)
+            if isinstance(text, str):
+                compact_text = "".join(text.split())
+                self.assertNotIn('"songId":"12345"', compact_text)
+                self.assertNotIn('"catalog"', text)
+                self.assertNotIn("C:/private", text)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,14 @@ The server stores only one in-memory snapshot, so a restart returns `absent`.
 A snapshot becomes `stale` after ten seconds by default. Paused playback with
 a fresh heartbeat is not stale.
 
+The browser keeps the original presence schema version 1. The Windows Reader
+uses schema version 2 and adds one exact `song.catalog` field: either `null` or
+`{"provider":"netease","songId":"<canonical positive numeric id>"}`. The
+Reader publishes a stable synthetic `song.songId`; catalog resolution never
+changes that public identity. It emits a NetEase reference only after a unique
+normalized title, artist, album, and duration match. An unresolved or ambiguous
+song stays `catalog: null`.
+
 The MCP process receives a separate read-only token. That token is accepted
 only for these backend requests:
 
@@ -49,11 +57,20 @@ only for these backend requests:
 - `GET /music/memory?id=<current numeric song id>`
 
 The backend checks that analysis/memory IDs match the fresh current presence.
-`music_analysis` reads an analysis that already exists. It never calls
-`POST /music/analyze`, downloads audio, or starts `librosa`. If the existing
-spectrogram PNG is present, the tool returns it as MCP `ImageContent`; no local
-filesystem path is exposed. `music_memory` reads only the fresh current song
-and never lists or changes the memory store.
+For analysis reads, the MCP request URL always uses that public current ID. A
+version 1 presence keeps the legacy direct-cache behavior. For a version 2
+Reader presence, the backend resolves a proven NetEase catalog ID internally;
+`catalog: null` never falls back to the synthetic ID. The stored analysis JSON
+must identify the resolved cache song exactly, then the response is rebound to
+the public synthetic ID. The provider ID is not exposed. A spectrogram is
+served only when its matching analysis JSON passes the same identity check.
+
+`music_analysis` reads an analysis that already exists. This identity bridge
+does not call `POST /music/analyze`, download audio, start `librosa`, or change
+the existing BPM/key/energy algorithm. If the verified spectrogram PNG is
+present, the tool returns it as MCP `ImageContent`; no local filesystem path is
+exposed. `music_memory` reads only the fresh current song and never lists or
+changes the memory store.
 
 ## Environment variables
 
@@ -295,9 +312,11 @@ data, but all four MCP tools fail closed and do not describe it as current.
 - Protected API auth is header-only and uses constant-time comparison.
 - Missing, weak, whitespace-containing, or identical full/read tokens prevent
   server startup.
-- The read token can fetch analysis, spectrogram, or memory only when its
+- The read token can fetch analysis, spectrogram, or memory only when its public
   numeric ID matches a fresh current presence; stale, absent, and wrong-song
-  requests fail closed.
+  requests fail closed. A version 2 analysis provider ID is derived only after
+  that gate from the same current snapshot and is never accepted in the public
+  query.
 - JSON request bodies are bounded; presence rejects unknown/control fields,
   invalid numeric song IDs, non-finite numbers, oversized text, and oversized
   lyric windows.
@@ -305,9 +324,11 @@ data, but all four MCP tools fail closed and do not describe it as current.
 - Duplicate or decreasing sequence numbers from one browser session return 409
   and cannot refresh or roll back the stored snapshot.
 - API JSON responses are marked `Cache-Control: no-store`.
-- Analysis results exposed to MCP omit local filesystem paths and raw analyzer
-  error text. The authenticated PNG response is bounded to 8 MiB and returned
-  with `no-store` and `nosniff` headers.
+- Analysis results exposed to MCP omit catalog/provider IDs, local filesystem
+  paths, and raw analyzer error text. The stored JSON song ID must match the
+  internally resolved cache ID before either JSON or PNG is returned. Orphan or
+  mismatched PNG files fail closed. The authenticated PNG response is bounded
+  to 8 MiB and returned with `no-store` and `nosniff` headers.
 - The backend cache route rejects JSON, lyrics, markers, errors, and analysis
   PNGs; it serves only positive numeric `<songId>.mp3` files required by the
   current browser audio flow. Production keeps that backend on loopback and
