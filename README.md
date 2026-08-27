@@ -77,6 +77,7 @@ Windows desktop players that expose GSMTC can use the independent
 ### Memory
 - `GET /music/memory?id=songId` — Get song notes
 - `POST /music/memory` — Save notes, feelings, tags
+- `POST /music/listen` — Record one validated, idempotent 30-second Reader listen event (full token only)
 
 ### Existing analysis
 - `GET /music/analyze/status?id=songId` — Sanitized BPM/key/energy status

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import concurrent.futures
 import http.client
 import json
 import logging
@@ -226,6 +227,21 @@ class PresenceApiTest(unittest.TestCase):
             return response.status, dict(response.getheaders()), response.read()
         finally:
             connection.close()
+
+    @staticmethod
+    def listen_event(
+        event_id: str = "listen:event-1",
+        song_id: str = "123",
+    ) -> dict:
+        return {
+            "eventId": event_id,
+            "songId": song_id,
+            "name": "Test Song",
+            "artist": "Test Artist",
+            "album": "Test Album",
+            "durationSeconds": 180.0,
+            "catalog": {"provider": "netease", "songId": "789"},
+        }
 
     def test_health_is_generic_plain_text_without_server_metadata(self) -> None:
         status, headers, body = self.request_bytes("GET", "/health")
@@ -466,6 +482,157 @@ class PresenceApiTest(unittest.TestCase):
         ):
             with self.subTest(path=path, state="stale"):
                 self.assertEqual(self.request("GET", path, token=READ_TOKEN)[0], 403)
+
+    def test_listen_event_is_persistent_idempotent_and_mcp_remains_read_only(self) -> None:
+        first_status, _, first = self.request(
+            "POST",
+            "/music/listen",
+            token=FULL_TOKEN,
+            payload=self.listen_event(),
+        )
+        duplicate_status, _, duplicate = self.request(
+            "POST",
+            "/music/listen",
+            token=FULL_TOKEN,
+            payload=self.listen_event(),
+        )
+        second_status, _, second = self.request(
+            "POST",
+            "/music/listen",
+            token=FULL_TOKEN,
+            payload=self.listen_event("listen:event-2"),
+        )
+
+        self.assertEqual(first_status, 200)
+        self.assertTrue(first["counted"])
+        self.assertEqual(first["listenCount"], 1)
+        self.assertEqual(duplicate_status, 200)
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["listenCount"], 1)
+        self.assertEqual(second_status, 200)
+        self.assertEqual(second["listenCount"], 2)
+        self.assertEqual(first["firstListened"], second["firstListened"])
+        self.assertNotIn("_listenEventIds", second)
+
+        unresolved = self.listen_event("listen:without-catalog", "124")
+        del unresolved["catalog"]
+        self.assertEqual(
+            self.request(
+                "POST",
+                "/music/listen",
+                token=FULL_TOKEN,
+                payload=unresolved,
+            )[0],
+            200,
+        )
+
+        memory_path = Path(self.temp_dir.name) / "music_memory.json"
+        stored = json.loads(memory_path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["123"]["listenCount"], 2)
+        self.assertEqual(
+            stored["123"]["_listenEventIds"],
+            ["listen:event-1", "listen:event-2"],
+        )
+        self.assertEqual(
+            stored["123"]["catalog"],
+            {"provider": "netease", "songId": "789"},
+        )
+        self.assertEqual(list(Path(self.temp_dir.name).glob(".music_memory.json.*.tmp")), [])
+
+        self.assertEqual(
+            self.request(
+                "POST",
+                "/music/presence",
+                token=FULL_TOKEN,
+                payload=playing_presence_for_song(123),
+            )[0],
+            200,
+        )
+        read_status, _, read_body = self.request(
+            "GET",
+            "/music/memory?id=123",
+            token=READ_TOKEN,
+        )
+        self.assertEqual(read_status, 200)
+        self.assertEqual(read_body["memory"]["listenCount"], 2)
+        self.assertEqual(
+            self.request(
+                "POST",
+                "/music/listen",
+                token=READ_TOKEN,
+                payload=self.listen_event("listen:read-token"),
+            )[0],
+            403,
+        )
+
+    def test_listen_event_validation_is_strict_and_corruption_fails_closed(self) -> None:
+        invalid_payloads = []
+        for field in ("eventId", "songId", "name", "artist", "album", "durationSeconds"):
+            payload = self.listen_event()
+            del payload[field]
+            invalid_payloads.append(payload)
+        invalid_payloads.extend(
+            [
+                {**self.listen_event(), "eventId": "bad event"},
+                {**self.listen_event(), "songId": "00123"},
+                {**self.listen_event(), "songId": True},
+                {**self.listen_event(), "durationSeconds": math.inf},
+                {**self.listen_event(), "name": "x" * 513},
+                {**self.listen_event(), "unexpected": True},
+                {
+                    **self.listen_event(),
+                    "catalog": {"provider": "other", "songId": "789"},
+                },
+            ]
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    self.request(
+                        "POST",
+                        "/music/listen",
+                        token=FULL_TOKEN,
+                        payload=payload,
+                    )[0],
+                    400,
+                )
+
+        memory_path = Path(self.temp_dir.name) / "music_memory.json"
+        memory_path.write_text("{broken", encoding="utf-8")
+        before = memory_path.read_bytes()
+        status, _, body = self.request(
+            "POST",
+            "/music/listen",
+            token=FULL_TOKEN,
+            payload=self.listen_event(),
+        )
+        self.assertEqual(status, 500)
+        self.assertEqual(body["error"], "song memory unavailable")
+        self.assertEqual(memory_path.read_bytes(), before)
+
+    def test_concurrent_unique_listen_events_do_not_lose_updates(self) -> None:
+        events = [self.listen_event(f"listen:concurrent-{index}") for index in range(16)]
+
+        def post(payload):
+            return self.request(
+                "POST",
+                "/music/listen",
+                token=FULL_TOKEN,
+                payload=payload,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(post, events))
+
+        self.assertTrue(all(status == 200 for status, _, _ in results))
+        status, _, body = self.request(
+            "GET",
+            "/music/memory?id=123",
+            token=FULL_TOKEN,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["memory"]["listenCount"], 16)
+        self.assertEqual(len(body["memory"]["_listenEventIds"]), 16)
 
     def test_v2_mcp_analysis_uses_catalog_cache_and_rebinds_public_song_id(self) -> None:
         cache_dir = self.state.data_dir / "music_cache"

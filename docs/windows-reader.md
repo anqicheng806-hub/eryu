@@ -87,6 +87,31 @@ cache. Catalog resolution itself only reuses search metadata: the Reader never
 calls `/music/url`, `/music/stream`, or `POST /music/analyze`, never downloads
 audio, and never starts analysis.
 
+## Listening memory
+
+The Reader counts one listen only after the same selected song has accumulated
+30 seconds of actual playing wall time. Paused time is excluded, timeline seeks
+do not add elapsed time, and switching songs starts a new visit. After an
+`ended`/idle boundary, replaying the same song also starts a new visit. Each
+qualifying visit emits one random event ID with the stable public song ID; a
+strictly resolved NetEase catalog ID is included only as an optional alias.
+Each observation contributes at most five seconds, so sleep or a long sampling
+gap fails closed by undercounting instead of inventing playback time.
+
+Listen events use the same process-only full Web token but a separate bounded
+background queue and `POST /music/listen`. Network errors retry the exact same
+event ID with bounded backoff, so the server can deduplicate an uncertain
+response. The listen worker never delays, wakes, or changes the two-second
+presence heartbeat. Stopping the Reader cancels any still-pending in-memory
+event; the Reader does not persist a local queue or any secret.
+
+The server accepts exact bounded listen fields, keeps at most 64 recent event
+IDs per song for deduplication, and updates `music_memory.json` under a process
+lock using a flushed temporary file followed by atomic replacement. A malformed
+existing memory file fails closed and is not overwritten. MCP remains read-only
+and can inspect only the fresh current song's sanitized count and timestamps;
+it cannot call the listen endpoint or write notes.
+
 ## Install the Windows-only dependency
 
 Run in Windows PowerShell from the repository root:

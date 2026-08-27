@@ -72,6 +72,13 @@ present, the tool returns it as MCP `ImageContent`; no local filesystem path is
 exposed. `music_memory` reads only the fresh current song and never lists or
 changes the memory store.
 
+The Windows Reader may use the full Web token to send one `POST /music/listen`
+after a selected song accumulates 30 seconds of actual playing time. That route
+is not in the MCP read-token allowlist. Each event has a retry-stable ID;
+duplicates return success without incrementing twice. The server serializes
+memory updates and atomically replaces the JSON file. Internal event IDs and an
+optional catalog alias are not returned by `music_memory`.
+
 ## Environment variables
 
 | Name | Process | Required | Purpose |
@@ -321,6 +328,9 @@ data, but all four MCP tools fail closed and do not describe it as current.
   invalid numeric song IDs, non-finite numbers, oversized text, and oversized
   lyric windows.
 - Presence lives only in memory and is never written every two seconds.
+- Reader listening memory is a separate one-shot event after 30 seconds of
+  actual playing. Pauses and timeline seeks do not count, retries reuse the
+  same event ID, and the MCP token cannot call the write route.
 - Duplicate or decreasing sequence numbers from one browser session return 409
   and cannot refresh or roll back the stored snapshot.
 - API JSON responses are marked `Cache-Control: no-store`.

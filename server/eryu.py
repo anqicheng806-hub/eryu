@@ -49,6 +49,7 @@ import random
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -90,6 +91,21 @@ logger = logging.getLogger("eryu")
 MAX_JSON_BODY_BYTES = 64 * 1024
 MAX_JSON_NESTING_DEPTH = 64
 MAX_SPECTROGRAM_BYTES = 8 * 1024 * 1024
+MAX_MEMORY_TEXT_LENGTH = 512
+MAX_MEMORY_EVENT_IDS = 64
+MAX_TRACK_DURATION_SECONDS = 24 * 60 * 60
+LISTEN_EVENT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+LISTEN_EVENT_KEYS = frozenset(
+    {
+        "eventId",
+        "songId",
+        "name",
+        "artist",
+        "album",
+        "durationSeconds",
+        "catalog",
+    }
+)
 ANALYZER_ENV_ALLOWLIST = frozenset(
     {
         "LANG",
@@ -151,6 +167,10 @@ class RequestBodyError(ValueError):
         self.status = status
         self.message = message
         self.close_connection = close_connection
+
+
+class SongMemoryStoreError(RuntimeError):
+    """A sanitized persistent-memory failure safe to report without details."""
 
 
 def _json_nesting_exceeds_limit(value: Any) -> bool:
@@ -634,17 +654,33 @@ class EryuHandler(BaseHTTPRequestHandler):
 
     def _load_song_memory(self) -> dict:
         p = self._song_memory_path()
-        if p.exists():
-            try:
-                return json.loads(p.read_text())
-            except Exception:
-                pass
-        return {}
+        if not p.exists():
+            return {}
+        try:
+            value = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SongMemoryStoreError("song memory is unavailable") from exc
+        if not isinstance(value, dict):
+            raise SongMemoryStoreError("song memory is unavailable")
+        return value
 
     def _save_song_memory(self, mem: dict):
         p = self._song_memory_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(mem, ensure_ascii=False, indent=1))
+        temp = p.with_name(f".{p.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temp.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(mem, handle, ensure_ascii=False, indent=1)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, p)
+        except (OSError, TypeError, ValueError) as exc:
+            raise SongMemoryStoreError("song memory is unavailable") from exc
+        finally:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # ── Audio download with CDN fallback ──
 
@@ -788,6 +824,8 @@ class EryuHandler(BaseHTTPRequestHandler):
             self._handle_music_recent_add(body)
         elif path == "/music/memory":
             self._handle_music_memory_save(body)
+        elif path == "/music/listen":
+            self._handle_music_listen(body)
         elif path == "/music/analyze":
             self._handle_analyze_trigger(body)
         elif path == "/music/listen-together":
@@ -1130,34 +1168,156 @@ class EryuHandler(BaseHTTPRequestHandler):
         data["recent"] = recent[:50]
         self._save_music_data(data)
         # Auto-increment listen count in song memory
-        mem = self._load_song_memory()
-        sid = str(song["songId"])
-        entry = mem.get(sid, {
-            "songId": song["songId"],
-            "name": song.get("name", ""),
-            "artist": song.get("artist", ""),
-            "listenCount": 0,
-            "togetherCount": 0,
-            "firstListened": None,
-            "lastListened": None,
-            "analyzed": False,
-            "notes": "",
-            "feeling": "",
-            "favoriteLines": [],
-            "tags": [],
-        })
-        entry["listenCount"] = entry.get("listenCount", 0) + 1
-        now = datetime.now(timezone.utc).isoformat()
-        entry["lastListened"] = now
-        if not entry.get("firstListened"):
-            entry["firstListened"] = now
-        entry["name"] = song.get("name", entry.get("name", ""))
-        entry["artist"] = song.get("artist", entry.get("artist", ""))
-        mem[sid] = entry
-        self._save_song_memory(mem)
+        try:
+            with self.state.music_memory_lock:
+                mem = self._load_song_memory()
+                sid = str(song["songId"])
+                entry = mem.get(sid, {
+                    "songId": song["songId"],
+                    "name": song.get("name", ""),
+                    "artist": song.get("artist", ""),
+                    "listenCount": 0,
+                    "togetherCount": 0,
+                    "firstListened": None,
+                    "lastListened": None,
+                    "analyzed": False,
+                    "notes": "",
+                    "feeling": "",
+                    "favoriteLines": [],
+                    "tags": [],
+                })
+                entry["listenCount"] = entry.get("listenCount", 0) + 1
+                now = datetime.now(timezone.utc).isoformat()
+                entry["lastListened"] = now
+                if not entry.get("firstListened"):
+                    entry["firstListened"] = now
+                entry["name"] = song.get("name", entry.get("name", ""))
+                entry["artist"] = song.get("artist", entry.get("artist", ""))
+                mem[sid] = entry
+                self._save_song_memory(mem)
+        except SongMemoryStoreError:
+            self._send_json(500, {"ok": False, "error": "song memory unavailable"})
+            return
         self._send_json(200, {"ok": True})
 
     # ── Song memory system ──
+
+    @staticmethod
+    def _listen_text(body: dict[str, Any], field: str) -> str:
+        value = body.get(field)
+        if not isinstance(value, str) or len(value) > MAX_MEMORY_TEXT_LENGTH:
+            raise RequestBodyError(400, f"{field} must be a bounded string")
+        return value.strip()
+
+    @staticmethod
+    def _listen_catalog(body: dict[str, Any]) -> dict[str, str] | None:
+        catalog = body.get("catalog")
+        if catalog is None:
+            return None
+        if not isinstance(catalog, dict) or set(catalog) != {"provider", "songId"}:
+            raise RequestBodyError(400, "catalog must be a valid provider reference")
+        song_id = catalog.get("songId")
+        if (
+            catalog.get("provider") != "netease"
+            or not isinstance(song_id, str)
+            or not is_valid_song_id(song_id)
+            or str(int(song_id)) != song_id
+        ):
+            raise RequestBodyError(400, "catalog must be a valid provider reference")
+        return {"provider": "netease", "songId": song_id}
+
+    def _handle_music_listen(self, body: dict[str, Any]):
+        if set(body) != LISTEN_EVENT_KEYS - {"catalog"} and set(body) != LISTEN_EVENT_KEYS:
+            self._send_json(400, {"error": "invalid listen event fields"})
+            return
+        event_id = body.get("eventId")
+        song_id = body.get("songId")
+        duration = body.get("durationSeconds")
+        if not isinstance(event_id, str) or not LISTEN_EVENT_ID_RE.fullmatch(event_id):
+            self._send_json(400, {"error": "invalid eventId"})
+            return
+        if not is_valid_song_id(song_id) or str(int(song_id)) != str(song_id):
+            self._send_json(400, {"error": "invalid songId"})
+            return
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(float(duration))
+            or float(duration) < 0
+            or float(duration) > MAX_TRACK_DURATION_SECONDS
+        ):
+            self._send_json(400, {"error": "invalid durationSeconds"})
+            return
+        try:
+            name = self._listen_text(body, "name")
+            artist = self._listen_text(body, "artist")
+            album = self._listen_text(body, "album")
+            catalog = self._listen_catalog(body)
+        except RequestBodyError as exc:
+            self._send_json(exc.status, {"error": exc.message})
+            return
+
+        sid = str(int(song_id))
+        try:
+            with self.state.music_memory_lock:
+                mem = self._load_song_memory()
+                existing = mem.get(sid)
+                if existing is not None and not isinstance(existing, dict):
+                    raise SongMemoryStoreError("song memory is unavailable")
+                entry = existing or {
+                    "songId": int(sid),
+                    "name": "",
+                    "artist": "",
+                    "album": "",
+                    "listenCount": 0,
+                    "togetherCount": 0,
+                    "firstListened": None,
+                    "lastListened": None,
+                    "analyzed": False,
+                    "notes": "",
+                    "feeling": "",
+                    "favoriteLines": [],
+                    "tags": [],
+                }
+                recent_ids = entry.get("_listenEventIds", [])
+                if not isinstance(recent_ids, list) or any(
+                    not isinstance(value, str) for value in recent_ids
+                ):
+                    raise SongMemoryStoreError("song memory is unavailable")
+                duplicate = event_id in recent_ids
+                if not duplicate:
+                    count = entry.get("listenCount", 0)
+                    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                        raise SongMemoryStoreError("song memory is unavailable")
+                    now = datetime.now(timezone.utc).isoformat()
+                    entry["listenCount"] = count + 1
+                    entry["lastListened"] = now
+                    if not entry.get("firstListened"):
+                        entry["firstListened"] = now
+                    entry["name"] = name
+                    entry["artist"] = artist
+                    entry["album"] = album
+                    entry["duration"] = float(duration)
+                    if catalog is not None:
+                        entry["catalog"] = catalog
+                    entry["_listenEventIds"] = (
+                        recent_ids + [event_id]
+                    )[-MAX_MEMORY_EVENT_IDS:]
+                    mem[sid] = entry
+                    self._save_song_memory(mem)
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "counted": not duplicate,
+                        "duplicate": duplicate,
+                        "listenCount": entry.get("listenCount", 0),
+                        "firstListened": entry.get("firstListened"),
+                        "lastListened": entry.get("lastListened"),
+                    },
+                )
+        except SongMemoryStoreError:
+            self._send_json(500, {"ok": False, "error": "song memory unavailable"})
 
     def _handle_music_memory_get(self):
         qs = parse_qs(urlparse(self.path).query)
@@ -1165,7 +1325,12 @@ class EryuHandler(BaseHTTPRequestHandler):
         if song_id and not is_valid_song_id(song_id):
             self._send_json(400, {"error": "id must be a positive numeric id"})
             return
-        mem = self._load_song_memory()
+        try:
+            with self.state.music_memory_lock:
+                mem = self._load_song_memory()
+        except SongMemoryStoreError:
+            self._send_json(500, {"ok": False, "error": "song memory unavailable"})
+            return
         if song_id:
             entry = mem.get(str(song_id))
             self._send_json(200, {"ok": True, "memory": entry})
@@ -1174,83 +1339,97 @@ class EryuHandler(BaseHTTPRequestHandler):
 
     def _handle_music_memory_save(self, body: dict):
         song_id = str(body.get("songId", ""))
-        if not song_id:
-            self._send_json(400, {"error": "missing songId"})
+        if not is_valid_song_id(song_id):
+            self._send_json(400, {"error": "invalid songId"})
             return
-        mem = self._load_song_memory()
-        entry = mem.get(song_id, {
-            "songId": int(song_id),
-            "name": "",
-            "artist": "",
-            "listenCount": 0,
-            "togetherCount": 0,
-            "firstListened": None,
-            "lastListened": None,
-            "analyzed": False,
-            "notes": "",
-            "feeling": "",
-            "favoriteLines": [],
-            "tags": [],
-        })
-        now = datetime.now(timezone.utc).isoformat()
-        action = body.get("action", "listen")
-        if action == "listen":
-            entry["listenCount"] = entry.get("listenCount", 0) + 1
-            entry["lastListened"] = now
-            if not entry.get("firstListened"):
-                entry["firstListened"] = now
-            entry["name"] = body.get("name", entry.get("name", ""))
-            entry["artist"] = body.get("artist", entry.get("artist", ""))
-        elif action == "together":
-            entry["togetherCount"] = entry.get("togetherCount", 0) + 1
-            entry["lastListened"] = now
-        elif action == "analyze":
-            entry["analyzed"] = True
-            if body.get("notes"):
-                entry["notes"] = body["notes"]
-            if body.get("feeling"):
-                entry["feeling"] = body["feeling"]
-            if body.get("favoriteLines"):
-                entry["favoriteLines"] = body["favoriteLines"]
-            if body.get("tags"):
-                entry["tags"] = body["tags"]
-            if body.get("bpm"):
-                entry["bpm"] = body["bpm"]
-            if body.get("duration"):
-                entry["duration"] = body["duration"]
-        elif action == "like":
-            entry["liked"] = True
-            entry["name"] = body.get("name", entry.get("name", ""))
-            entry["artist"] = body.get("artist", entry.get("artist", ""))
-            cover = self._ensure_cover(song_id, body.get("cover", ""))
-            song_obj = {
-                "songId": int(song_id),
-                "name": entry["name"],
-                "artist": entry["artist"],
-                "cover": cover,
-                "addedBy": body.get("by", "user"),
-            }
-            data = self._load_music_data()
-            # Add to a "Liked by User" playlist (auto-create if missing)
-            liked_pl = None
-            for pl in data.get("playlists", []):
-                if pl.get("id") == "user_liked":
-                    liked_pl = pl
-                    break
-            if not liked_pl:
-                liked_pl = {"id": "user_liked", "name": "User Liked", "songs": []}
-                data.setdefault("playlists", []).append(liked_pl)
-            if not any(s.get("songId") == int(song_id) for s in liked_pl["songs"]):
-                liked_pl["songs"].append(song_obj)
-                self._save_music_data(data)
-        elif action == "note":
-            entry["notes"] = body.get("notes", entry.get("notes", ""))
-            if body.get("feeling"):
-                entry["feeling"] = body["feeling"]
-            if body.get("favoriteLines"):
-                entry["favoriteLines"] = body["favoriteLines"]
-        mem[song_id] = entry
-        self._save_song_memory(mem)
+        try:
+            with self.state.music_memory_lock:
+                mem = self._load_song_memory()
+                entry = mem.get(song_id, {
+                    "songId": int(song_id),
+                    "name": "",
+                    "artist": "",
+                    "listenCount": 0,
+                    "togetherCount": 0,
+                    "firstListened": None,
+                    "lastListened": None,
+                    "analyzed": False,
+                    "notes": "",
+                    "feeling": "",
+                    "favoriteLines": [],
+                    "tags": [],
+                })
+                now = datetime.now(timezone.utc).isoformat()
+                action = body.get("action", "listen")
+                if action == "listen":
+                    entry["listenCount"] = entry.get("listenCount", 0) + 1
+                    entry["lastListened"] = now
+                    if not entry.get("firstListened"):
+                        entry["firstListened"] = now
+                    entry["name"] = body.get("name", entry.get("name", ""))
+                    entry["artist"] = body.get("artist", entry.get("artist", ""))
+                elif action == "together":
+                    entry["togetherCount"] = entry.get("togetherCount", 0) + 1
+                    entry["lastListened"] = now
+                elif action == "analyze":
+                    entry["analyzed"] = True
+                    if body.get("notes"):
+                        entry["notes"] = body["notes"]
+                    if body.get("feeling"):
+                        entry["feeling"] = body["feeling"]
+                    if body.get("favoriteLines"):
+                        entry["favoriteLines"] = body["favoriteLines"]
+                    if body.get("tags"):
+                        entry["tags"] = body["tags"]
+                    if body.get("bpm"):
+                        entry["bpm"] = body["bpm"]
+                    if body.get("duration"):
+                        entry["duration"] = body["duration"]
+                elif action == "like":
+                    entry["liked"] = True
+                    entry["name"] = body.get("name", entry.get("name", ""))
+                    entry["artist"] = body.get("artist", entry.get("artist", ""))
+                    cover = self._ensure_cover(song_id, body.get("cover", ""))
+                    song_obj = {
+                        "songId": int(song_id),
+                        "name": entry["name"],
+                        "artist": entry["artist"],
+                        "cover": cover,
+                        "addedBy": body.get("by", "user"),
+                    }
+                    data = self._load_music_data()
+                    liked_pl = None
+                    for playlist in data.get("playlists", []):
+                        if playlist.get("id") == "user_liked":
+                            liked_pl = playlist
+                            break
+                    if not liked_pl:
+                        liked_pl = {
+                            "id": "user_liked",
+                            "name": "User Liked",
+                            "songs": [],
+                        }
+                        data.setdefault("playlists", []).append(liked_pl)
+                    if not any(
+                        song.get("songId") == int(song_id)
+                        for song in liked_pl["songs"]
+                    ):
+                        liked_pl["songs"].append(song_obj)
+                        self._save_music_data(data)
+                elif action == "note":
+                    entry["notes"] = body.get("notes", entry.get("notes", ""))
+                    if body.get("feeling"):
+                        entry["feeling"] = body["feeling"]
+                    if body.get("favoriteLines"):
+                        entry["favoriteLines"] = body["favoriteLines"]
+                else:
+                    self._send_json(400, {"error": "invalid memory action"})
+                    return
+                mem[song_id] = entry
+                self._save_song_memory(mem)
+        except SongMemoryStoreError:
+            self._send_json(500, {"ok": False, "error": "song memory unavailable"})
+            return
         self._send_json(200, {"ok": True, "memory": entry})
 
     # ── Listen together ──
@@ -1267,31 +1446,36 @@ class EryuHandler(BaseHTTPRequestHandler):
             return
         is_roam = body.get("roam", False)
         # Record in song memory
-        mem = self._load_song_memory()
-        sid = str(song_id)
-        entry = mem.get(sid, {
-            "songId": song_id,
-            "name": name,
-            "artist": artist,
-            "listenCount": 0,
-            "togetherCount": 0,
-            "firstListened": None,
-            "lastListened": None,
-            "analyzed": False,
-            "notes": "",
-            "feeling": "",
-            "favoriteLines": [],
-            "tags": [],
-        })
-        now = datetime.now(timezone.utc).isoformat()
-        entry["listenCount"] = entry.get("listenCount", 0) + 1
-        entry["lastListened"] = now
-        if not entry.get("firstListened"):
-            entry["firstListened"] = now
-        entry["name"] = name or entry.get("name", "")
-        entry["artist"] = artist or entry.get("artist", "")
-        mem[sid] = entry
-        self._save_song_memory(mem)
+        try:
+            with self.state.music_memory_lock:
+                mem = self._load_song_memory()
+                sid = str(song_id)
+                entry = mem.get(sid, {
+                    "songId": song_id,
+                    "name": name,
+                    "artist": artist,
+                    "listenCount": 0,
+                    "togetherCount": 0,
+                    "firstListened": None,
+                    "lastListened": None,
+                    "analyzed": False,
+                    "notes": "",
+                    "feeling": "",
+                    "favoriteLines": [],
+                    "tags": [],
+                })
+                now = datetime.now(timezone.utc).isoformat()
+                entry["listenCount"] = entry.get("listenCount", 0) + 1
+                entry["lastListened"] = now
+                if not entry.get("firstListened"):
+                    entry["firstListened"] = now
+                entry["name"] = name or entry.get("name", "")
+                entry["artist"] = artist or entry.get("artist", "")
+                mem[sid] = entry
+                self._save_song_memory(mem)
+        except SongMemoryStoreError:
+            self._send_json(500, {"ok": False, "error": "song memory unavailable"})
+            return
         logger.info("listen-together: %s — %s (roam=%s)", name, artist, is_roam)
         self._send_json(200, {"ok": True})
 
@@ -1306,18 +1490,23 @@ class EryuHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "counted": False})
             return
         sid = str(song_id)
-        mem = self._load_song_memory()
-        entry = mem.get(sid)
-        if not entry:
-            self._send_json(200, {"ok": True, "counted": False})
+        try:
+            with self.state.music_memory_lock:
+                mem = self._load_song_memory()
+                entry = mem.get(sid)
+                if not entry:
+                    self._send_json(200, {"ok": True, "counted": False})
+                    return
+                now = datetime.now(timezone.utc).isoformat()
+                entry["togetherCount"] = entry.get("togetherCount", 0) + 1
+                entry["lastListened"] = now
+                if not entry.get("firstListened"):
+                    entry["firstListened"] = now
+                mem[sid] = entry
+                self._save_song_memory(mem)
+        except SongMemoryStoreError:
+            self._send_json(500, {"ok": False, "error": "song memory unavailable"})
             return
-        now = datetime.now(timezone.utc).isoformat()
-        entry["togetherCount"] = entry.get("togetherCount", 0) + 1
-        entry["lastListened"] = now
-        if not entry.get("firstListened"):
-            entry["firstListened"] = now
-        mem[sid] = entry
-        self._save_song_memory(mem)
         self._send_json(200, {"ok": True, "counted": True})
 
     # ── Read-only companion presence ──
@@ -1485,7 +1674,12 @@ class EryuHandler(BaseHTTPRequestHandler):
     # ── Stats ──
 
     def _handle_music_stats(self):
-        mem = self._load_song_memory()
+        try:
+            with self.state.music_memory_lock:
+                mem = self._load_song_memory()
+        except SongMemoryStoreError:
+            self._send_json(500, {"ok": False, "error": "song memory unavailable"})
+            return
         total_songs = len(mem)
         total_listens = sum(e.get("listenCount", 0) for e in mem.values())
         together_listens = sum(e.get("togetherCount", 0) for e in mem.values())
@@ -1687,6 +1881,7 @@ class ServerState:
         )
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "music_cache").mkdir(parents=True, exist_ok=True)
+        self.music_memory_lock = threading.RLock()
         presence_kwargs = {}
         if presence_clock is not None:
             presence_kwargs["monotonic"] = presence_clock

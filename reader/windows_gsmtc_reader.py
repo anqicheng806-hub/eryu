@@ -22,6 +22,7 @@ import re
 import signal
 import sys
 import tempfile
+import time
 import unicodedata
 import uuid
 from collections import OrderedDict
@@ -42,6 +43,11 @@ DEFAULT_HEARTBEAT_SECONDS = 2.0
 DEFAULT_LOCK_FILE = Path(tempfile.gettempdir()) / "eryu-gsmtc-reader.lock"
 DEFAULT_RETRY_DELAY_SECONDS = 30.0
 DEFAULT_LYRICS_TIMEOUT_SECONDS = 12.0
+DEFAULT_LISTEN_THRESHOLD_SECONDS = 30.0
+MAX_LISTEN_OBSERVATION_GAP_SECONDS = 5.0
+DEFAULT_LISTEN_RETRY_DELAY_SECONDS = 2.0
+MAX_LISTEN_RETRY_DELAY_SECONDS = 30.0
+MAX_PENDING_LISTEN_EVENTS = 32
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
 NETEASE_SONG_ID_PATTERN = re.compile(r"^[0-9]{1,20}$")
 LRC_TIMESTAMP_PATTERN = re.compile(
@@ -223,6 +229,199 @@ class _LyricsJob:
 class HttpResult:
     status: int
     body: str | None = None
+
+
+class ListenEventTracker:
+    """Count actual playing wall time once for each selected-song visit."""
+
+    def __init__(
+        self,
+        *,
+        threshold_seconds: float = DEFAULT_LISTEN_THRESHOLD_SECONDS,
+        max_observation_gap_seconds: float = MAX_LISTEN_OBSERVATION_GAP_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+        event_id_factory: Callable[[], str] | None = None,
+    ) -> None:
+        self.threshold_seconds = max(1.0, float(threshold_seconds))
+        self.max_observation_gap_seconds = max(
+            0.1,
+            float(max_observation_gap_seconds),
+        )
+        self._monotonic = monotonic
+        self._event_id_factory = event_id_factory or (
+            lambda: f"listen:{uuid.uuid4().hex}"
+        )
+        self._session: PresenceSession | None = None
+        self._key: tuple[str, str, str, str] | None = None
+        self._event_id = ""
+        self._catalog_song_id: str | None = None
+        self._accumulated_seconds = 0.0
+        self._last_observed = 0.0
+        self._last_playing = False
+        self._terminal = False
+        self._counted = False
+
+    @staticmethod
+    def _is_terminal(session: PresenceSession) -> bool:
+        return _coerce_status(session.status) in {"ended", "idle", "error"}
+
+    def _start_visit(
+        self,
+        session: PresenceSession | None,
+        now: float,
+        catalog_song_id: str | None,
+    ) -> None:
+        self._session = session
+        self._key = _session_key(session) if session is not None else None
+        self._event_id = self._event_id_factory() if session is not None else ""
+        self._catalog_song_id = _valid_provider_song_id(catalog_song_id)
+        self._accumulated_seconds = 0.0
+        self._last_observed = now
+        self._last_playing = bool(session is not None and session.playing)
+        self._terminal = bool(session is not None and self._is_terminal(session))
+        self._counted = False
+
+    def _build_event(self) -> dict[str, Any] | None:
+        if self._session is None or not self._event_id:
+            return None
+        event: dict[str, Any] = {
+            "eventId": self._event_id,
+            "songId": _presence_song_id(self._session),
+            "name": _safe_text(self._session.title, MAX_TEXT_LENGTH),
+            "artist": _safe_text(self._session.artist, MAX_TEXT_LENGTH),
+            "album": _safe_text(self._session.album, MAX_TEXT_LENGTH),
+            "durationSeconds": _safe_number(self._session.duration_seconds),
+        }
+        if self._catalog_song_id is not None:
+            event["catalog"] = {
+                "provider": "netease",
+                "songId": self._catalog_song_id,
+            }
+        return event
+
+    def observe(
+        self,
+        session: PresenceSession | None,
+        *,
+        catalog_song_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        now = float(self._monotonic())
+        if self._session is None:
+            self._start_visit(session, now, catalog_song_id)
+            return None
+
+        same_song = session is not None and _session_key(session) == self._key
+        elapsed = min(
+            max(0.0, now - self._last_observed),
+            self.max_observation_gap_seconds,
+        )
+        if self._last_playing:
+            self._accumulated_seconds += elapsed
+        if same_song:
+            assert session is not None
+            self._session = session
+            provider_id = _valid_provider_song_id(catalog_song_id)
+            if provider_id is not None:
+                self._catalog_song_id = provider_id
+
+        event = None
+        if not self._counted and self._accumulated_seconds >= self.threshold_seconds:
+            self._counted = True
+            event = self._build_event()
+
+        if not same_song:
+            self._start_visit(session, now, catalog_song_id)
+            return event
+
+        assert session is not None
+        if self._terminal and session.playing:
+            self._start_visit(session, now, catalog_song_id)
+            return event
+
+        self._last_observed = now
+        self._last_playing = bool(session.playing)
+        self._terminal = self._is_terminal(session)
+        return event
+
+
+class ListenEventReporter:
+    """Retry listen events independently from the presence heartbeat."""
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        retry_delay_seconds: float = DEFAULT_LISTEN_RETRY_DELAY_SECONDS,
+        max_retry_delay_seconds: float = MAX_LISTEN_RETRY_DELAY_SECONDS,
+    ) -> None:
+        self.client = client
+        self.retry_delay_seconds = max(0.01, float(retry_delay_seconds))
+        self.max_retry_delay_seconds = max(
+            self.retry_delay_seconds,
+            float(max_retry_delay_seconds),
+        )
+        self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=MAX_PENDING_LISTEN_EVENTS
+        )
+        self._task: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+
+    def submit(self, event: dict[str, Any]) -> bool:
+        try:
+            self.queue.put_nowait(event)
+            return True
+        except asyncio.QueueFull:
+            LOGGER.warning("listen event queue full; newest event was dropped")
+            return False
+
+    async def _run(self) -> None:
+        while True:
+            event = await self.queue.get()
+            delay = self.retry_delay_seconds
+            try:
+                while True:
+                    try:
+                        result = await self.client.post_listen(event)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        LOGGER.warning("listen event post failed: %s", exc)
+                    else:
+                        if result.status in {200, 409}:
+                            LOGGER.info(
+                                "listen event accepted: title=%s",
+                                _safe_text(event.get("name"), 80),
+                            )
+                            break
+                        if 400 <= result.status < 500:
+                            LOGGER.warning(
+                                "listen event rejected permanently: status=%s body=%s",
+                                result.status,
+                                "present" if result.body else "empty",
+                            )
+                            break
+                        LOGGER.warning(
+                            "listen event temporarily rejected: status=%s",
+                            result.status,
+                        )
+                    await asyncio.sleep(delay)
+                    delay = min(self.max_retry_delay_seconds, delay * 2)
+            finally:
+                self.queue.task_done()
+
+    async def close(self) -> None:
+        task = self._task
+        self._task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def _session_key(session: PresenceSession) -> tuple[str, str, str, str]:
@@ -621,7 +820,7 @@ class PresenceHttpClient:
             basic_auth_password,
         )
 
-    def _request(self, payload: dict[str, Any]) -> HttpResult:
+    def _request_path(self, path: str, payload: dict[str, Any]) -> HttpResult:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
@@ -630,7 +829,7 @@ class PresenceHttpClient:
         if self._basic_authorization:
             headers["Authorization"] = self._basic_authorization
         request = urllib.request.Request(
-            f"{self.endpoint}/music/presence",
+            f"{self.endpoint}{path}",
             data=raw,
             method="POST",
             headers=headers,
@@ -643,10 +842,16 @@ class PresenceHttpClient:
             body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
             return HttpResult(exc.code, body)
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"presence post failed: {exc}") from exc
+            raise RuntimeError(f"Eryu POST failed: {exc}") from exc
+
+    def _request(self, payload: dict[str, Any]) -> HttpResult:
+        return self._request_path("/music/presence", payload)
 
     async def post(self, payload: dict[str, Any]) -> HttpResult:
         return await asyncio.to_thread(self._request, payload)
+
+    async def post_listen(self, payload: dict[str, Any]) -> HttpResult:
+        return await asyncio.to_thread(self._request_path, "/music/listen", payload)
 
 
 class LyricsLookupError(RuntimeError):
@@ -1251,6 +1456,9 @@ class GSMTCReader:
         lock_path: Path = DEFAULT_LOCK_FILE,
         adapter: _WindowsGSMTCAdapter | None = None,
         http_client: PresenceHttpClient | None = None,
+        listen_client: PresenceHttpClient | None = None,
+        listen_tracker: ListenEventTracker | None = None,
+        listen_reporter: ListenEventReporter | None = None,
         lyrics_client: LyricsHttpClient | None = None,
         lyrics_enricher: LyricsEnricher | None = None,
         lock: SingleInstanceGuard | None = None,
@@ -1276,6 +1484,16 @@ class GSMTCReader:
         self._last_session_key: tuple[str, str, str, str] | None = None
         session_id = f"gsmtc:{Path(sys.executable).name}:{os.getpid()}:{uuid.uuid4()}"
         self._sequence_session = PresencePayloadBuilder(session_id)
+        self.listen_tracker = listen_tracker or ListenEventTracker()
+        self.listen_reporter = listen_reporter or ListenEventReporter(
+            listen_client
+            or PresenceHttpClient(
+                endpoint,
+                token,
+                basic_auth_user=basic_auth_user,
+                basic_auth_password=basic_auth_password,
+            )
+        )
         self.lyrics = lyrics_enricher or LyricsEnricher(
             lyrics_client
             or LyricsHttpClient(
@@ -1339,6 +1557,16 @@ class GSMTCReader:
             self._sequence += 1
         return success
 
+    def _observe_listen(self, session: PresenceSession | None) -> None:
+        lyrics = self.lyrics.snapshot_for(session)
+        catalog_song_id = lyrics.catalog_song_id if lyrics is not None else None
+        event = self.listen_tracker.observe(
+            session,
+            catalog_song_id=catalog_song_id,
+        )
+        if event is not None:
+            self.listen_reporter.submit(event)
+
     def _log_selected_session(self, session: PresenceSession | None) -> None:
         key = (
             session.source_app_user_model_id if session else "",
@@ -1366,13 +1594,17 @@ class GSMTCReader:
         self.notify_loop = asyncio.get_running_loop()
         retry_wait = self.heartbeat
         lyrics_started = False
+        listen_reporter_started = False
         try:
             await self.lyrics.start()
             lyrics_started = True
+            await self.listen_reporter.start()
+            listen_reporter_started = True
             await self.adapter.initialize()
             self.adapter.attach_change_listener(self._on_changed)
             current = await self.adapter.current_session()
             self.lyrics.observe(current)
+            self._observe_listen(current)
             self._log_selected_session(current)
             initial_success = await self._send_once(current)
             if not initial_success:
@@ -1385,6 +1617,7 @@ class GSMTCReader:
                 self.notify.clear()
                 session = await self.adapter.current_session()
                 self.lyrics.observe(session)
+                self._observe_listen(session)
                 self._log_selected_session(session)
                 success = await self._publish(session, sequence=self._sequence)
                 if success:
@@ -1395,10 +1628,14 @@ class GSMTCReader:
                 )
         finally:
             try:
-                if lyrics_started:
-                    await self.lyrics.close()
+                if listen_reporter_started:
+                    await self.listen_reporter.close()
             finally:
-                self.lock.release()
+                try:
+                    if lyrics_started:
+                        await self.lyrics.close()
+                finally:
+                    self.lock.release()
 
     def stop(self) -> None:
         self._running = False

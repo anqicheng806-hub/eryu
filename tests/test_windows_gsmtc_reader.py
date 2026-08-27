@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from reader.windows_gsmtc_reader import (
     GSMTCReader,
     HttpResult,
+    ListenEventReporter,
+    ListenEventTracker,
     LyricLine,
     LyricsEnricher,
     LyricsHttpClient,
@@ -51,6 +53,112 @@ def session(
         position_seconds=position,
         duration_seconds=duration,
     )
+
+
+class _MonotonicClock:
+    def __init__(self):
+        self.value = 100.0
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
+class ListenEventTrackerTest(unittest.TestCase):
+    def make_tracker(self):
+        clock = _MonotonicClock()
+        event_ids = iter(("listen:event-1", "listen:event-2", "listen:event-3"))
+        tracker = ListenEventTracker(
+            monotonic=clock,
+            event_id_factory=lambda: next(event_ids),
+        )
+        return tracker, clock
+
+    def test_counts_once_after_thirty_seconds_and_keeps_catalog_alias(self):
+        tracker, clock = self.make_tracker()
+        current = session(duration=180.0)
+
+        self.assertIsNone(tracker.observe(current))
+        for index in range(5):
+            clock.advance(5)
+            self.assertIsNone(
+                tracker.observe(
+                    current,
+                    catalog_song_id="12345" if index == 0 else None,
+                )
+            )
+        clock.advance(5)
+        event = tracker.observe(current)
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event["eventId"], "listen:event-1")
+        self.assertEqual(event["name"], "Song A")
+        self.assertEqual(event["durationSeconds"], 180.0)
+        self.assertEqual(
+            event["catalog"],
+            {"provider": "netease", "songId": "12345"},
+        )
+        clock.advance(60)
+        self.assertIsNone(tracker.observe(current))
+
+    def test_paused_time_and_timeline_seek_do_not_count(self):
+        tracker, clock = self.make_tracker()
+        playing = session(position=1.0)
+        paused = session(status="paused", playing=False, position=90.0)
+
+        tracker.observe(playing)
+        clock.advance(5)
+        self.assertIsNone(tracker.observe(playing))
+        clock.advance(5)
+        self.assertIsNone(tracker.observe(paused))
+        clock.advance(100)
+        self.assertIsNone(tracker.observe(paused))
+        self.assertIsNone(tracker.observe(playing))
+        for position in (99.0, 2.0, 75.0):
+            clock.advance(5)
+            self.assertIsNone(tracker.observe(session(position=position)))
+        clock.advance(5)
+        self.assertIsNotNone(tracker.observe(session(position=2.0)))
+
+    def test_long_observation_gap_is_not_mistaken_for_playback(self):
+        tracker, clock = self.make_tracker()
+        current = session()
+
+        tracker.observe(current)
+        clock.advance(3600)
+        self.assertIsNone(tracker.observe(current))
+        for _ in range(4):
+            clock.advance(5)
+            self.assertIsNone(tracker.observe(current))
+        clock.advance(5)
+        self.assertIsNotNone(tracker.observe(current))
+
+    def test_song_switch_resets_and_terminal_replay_is_a_new_visit(self):
+        tracker, clock = self.make_tracker()
+        first = session(title="First")
+        second = session(title="Second")
+
+        tracker.observe(first)
+        clock.advance(29)
+        self.assertIsNone(tracker.observe(second))
+        for _ in range(5):
+            clock.advance(5)
+            self.assertIsNone(tracker.observe(second))
+        clock.advance(5)
+        first_event = tracker.observe(second)
+        self.assertEqual(first_event["eventId"], "listen:event-2")
+
+        ended = session(title="Second", status="ended", playing=False)
+        self.assertIsNone(tracker.observe(ended))
+        self.assertIsNone(tracker.observe(second))
+        for _ in range(5):
+            clock.advance(5)
+            self.assertIsNone(tracker.observe(second))
+        clock.advance(5)
+        replay_event = tracker.observe(second)
+        self.assertEqual(replay_event["eventId"], "listen:event-3")
 
 
 class PayloadBuilderTest(unittest.TestCase):
@@ -448,6 +556,19 @@ class _ScriptedClient:
         return outcome
 
 
+class _ScriptedListenClient:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.event_ids = []
+
+    async def post_listen(self, payload):
+        self.event_ids.append(payload["eventId"])
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
 class _CurrentSessionAdapter(_FakeAdapter):
     def __init__(self, current):
         self.current = current
@@ -485,6 +606,33 @@ class _BlockingLyricsClient:
         self.calls += 1
         self.started.set()
         await asyncio.Future()
+
+
+class _BlockingListenClient:
+    def __init__(self):
+        self.started = asyncio.Event()
+
+    async def post_listen(self, _payload):
+        self.started.set()
+        await asyncio.Future()
+
+
+class _OneListenTracker:
+    def __init__(self):
+        self.sent = False
+
+    def observe(self, current_session, *, catalog_song_id=None):
+        if self.sent or current_session is None:
+            return None
+        self.sent = True
+        return {
+            "eventId": "listen:background-test",
+            "songId": "123",
+            "name": current_session.title,
+            "artist": current_session.artist,
+            "album": current_session.album,
+            "durationSeconds": current_session.duration_seconds,
+        }
 
 
 class _OutcomeLyricsClient:
@@ -565,6 +713,60 @@ class ReaderSequenceTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await reader._send_once(session()))
         self.assertEqual(reader._sequence, 2)
         self.assertEqual(client.sequences, [1])
+
+
+class ListenEventReporterTest(unittest.IsolatedAsyncioTestCase):
+    async def test_uncertain_post_retries_the_same_event_id(self):
+        client = _ScriptedListenClient(
+            [RuntimeError("network unavailable"), HttpResult(200, "{}")]
+        )
+        reporter = ListenEventReporter(
+            client,
+            retry_delay_seconds=0.01,
+            max_retry_delay_seconds=0.01,
+        )
+        await reporter.start()
+        self.assertTrue(
+            reporter.submit(
+                {
+                    "eventId": "listen:same-event",
+                    "songId": "123",
+                    "name": "Song",
+                }
+            )
+        )
+
+        await asyncio.wait_for(reporter.queue.join(), timeout=1.0)
+        await reporter.close()
+
+        self.assertEqual(
+            client.event_ids,
+            ["listen:same-event", "listen:same-event"],
+        )
+
+    async def test_blocked_listen_post_does_not_block_presence_heartbeat(self):
+        presence_client = _WakePresenceClient(target_count=3)
+        listen_client = _BlockingListenClient()
+        current = session(position=5.0)
+        reader = GSMTCReader(
+            "http://127.0.0.1:9090",
+            "x" * 32,
+            adapter=_CurrentSessionAdapter(current),
+            http_client=presence_client,
+            listen_client=listen_client,
+            listen_tracker=_OneListenTracker(),
+            lyrics_client=_OutcomeLyricsClient(LyricsLookupResult("none")),
+            lock=_FakeLock(),
+        )
+        presence_client.reader = reader
+
+        await asyncio.wait_for(reader.run(), timeout=2.0)
+
+        self.assertTrue(listen_client.started.is_set())
+        self.assertEqual(
+            [payload["sequence"] for payload in presence_client.payloads],
+            [1, 2, 3],
+        )
 
 
 class LyricsEnricherTest(unittest.IsolatedAsyncioTestCase):

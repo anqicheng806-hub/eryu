@@ -832,7 +832,11 @@ class MusicMcpTests(unittest.IsolatedAsyncioTestCase):
                         "tags": ["night"],
                         "listenCount": 4,
                         "togetherCount": 2,
+                        "firstListened": "2026-08-27T09:00:00+00:00",
+                        "lastListened": "2026-08-27T09:30:00+00:00",
                         "analyzed": False,
+                        "_listenEventIds": ["listen:internal"],
+                        "catalog": {"provider": "netease", "songId": "789"},
                         "internalSecret": "must not escape",
                     },
                 },
@@ -842,6 +846,13 @@ class MusicMcpTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["available"])
         self.assertEqual(result["memory"]["notes"], "existing note")
         self.assertFalse(result["memory"]["analyzed"])
+        self.assertEqual(result["memory"]["listenCount"], 4)
+        self.assertEqual(
+            result["memory"]["lastListened"],
+            "2026-08-27T09:30:00+00:00",
+        )
+        self.assertNotIn("_listenEventIds", result["memory"])
+        self.assertNotIn("catalog", result["memory"])
         self.assertNotIn("internalSecret", result["memory"])
         self.assertNotIn("must not escape", json.dumps(result))
         self.assertEqual(
